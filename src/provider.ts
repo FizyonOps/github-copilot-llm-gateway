@@ -624,7 +624,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const metadata = this.modelMetadata.get(modelId);
     const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
     const modelMaxOutput = metadata?.maxOutputTokens || this.config.defaultMaxOutputTokens || 2048;
-    
+
     const totalEstimatedTokens = estimatedInputTokens + toolsOverhead;
     const conservativeInputEstimate = Math.ceil(totalEstimatedTokens * 1.2);
     const bufferTokens = 256;
@@ -806,7 +806,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const metadata = this.modelMetadata.get(model.id);
     const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
     const modelMaxOutput = metadata?.maxOutputTokens || this.config.defaultMaxOutputTokens || 2048;
-    
+
     const desiredOutputTokens = Math.min(modelMaxOutput, Math.floor(modelMaxContext / 2));
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
     const maxInputTokens = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
