@@ -11,11 +11,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly outputChannel: vscode.OutputChannel;
   // Store tool schemas for the current request to fill missing required properties
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
-  // Track if we've shown the welcome notification this session
-  private hasShownWelcomeNotification = false;
-  // Cache model metadata
+  private statusBarItem: vscode.StatusBarItem | undefined;
   private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
-
   constructor(private readonly context: vscode.ExtensionContext) {
     this.outputChannel = vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
     this.config = this.loadConfig();
@@ -197,18 +194,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         continue;
       }
 
-      // Skip tools that look like broken internal VS Code tools
-      // These often appear as "search_view_results" and similar internal references
-      const brokenToolPatterns = [
-        'search_view_results',
-        'view_results',
-        'vscode_internal',
-        'extension_',
-        'unknown_',
-      ];
-
-      if (brokenToolPatterns.some(pattern => tool.name.toLowerCase().includes(pattern))) {
-        this.outputChannel.appendLine(`  FILTERED: ${tool.name} - appears to be a broken internal tool`);
+      let excluded = false;
+      for (const pattern of this.config.toolExcludePatterns) {
+        try {
+          if (new RegExp(pattern, 'i').test(tool.name)) {
+            this.outputChannel.appendLine(`  FILTERED: ${tool.name} - matched exclude pattern: ${pattern}`);
+            excluded = true;
+            break;
+          }
+        } catch (e) {
+          this.outputChannel.appendLine(`WARNING: Invalid toolExcludePatterns regex "${pattern}": ${e}`);
+        }
+      }
+      if (excluded) {
         continue;
       }
 
@@ -388,6 +386,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const missingBrackets = this.countChar(result, '[') - this.countChar(result, ']');
     const missingBraces = this.countChar(result, '{') - this.countChar(result, '}');
 
+    if (Math.max(missingBrackets, missingBraces) > 50) {
+      this.outputChannel.appendLine(`WARNING: JSON nesting depth exceeds 50, skipping bracket balancing`);
+      return str;
+    }
+
     result += ']'.repeat(Math.max(0, missingBrackets));
     result += '}'.repeat(Math.max(0, missingBraces));
 
@@ -435,56 +438,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`Original: ${jsonStr.substring(0, 500)}${jsonStr.length > 500 ? '...' : ''}`);
       return null;
     }
-  }
-
-  // Helper method: streamChatCompletion (updated for new client interface)
-  private async streamChatCompletion(
-    requestOptions: any,
-    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-    token: vscode.CancellationToken
-  ): Promise<void> {
-    this.currentToolSchemas.clear();
-    this.outputChannel.appendLine(`Streaming chat completion...`);
-    let totalContent = '';
-    let totalToolCalls = 0;
-
-    for await (const chunk of this.client.streamChatCompletion(requestOptions, token)) {
-      if (token.isCancellationRequested) {
-        break;
-      }
-
-      // Report text content immediately
-      if (chunk.content) {
-        totalContent += chunk.content;
-        progress.report(new vscode.LanguageModelTextPart(chunk.content));
-      }
-
-      // Process finished tool calls (fully accumulated by client)
-      if (chunk.finished_tool_calls && chunk.finished_tool_calls.length > 0) {
-        for (const toolCall of chunk.finished_tool_calls) {
-          totalToolCalls++;
-          this.outputChannel.appendLine(`Tool call received: id=${toolCall.id}, name=${toolCall.name}`);
-          this.outputChannel.appendLine(`  Raw arguments: ${toolCall.arguments.substring(0, 500)}${toolCall.arguments.length > 500 ? '...' : ''}`);
-
-          // Parse arguments with repair capability
-          let args = this.tryRepairJson(toolCall.arguments) as Record<string, unknown> | null;
-
-          if (args === null) {
-            this.outputChannel.appendLine(`ERROR: Failed to parse tool call arguments for ${toolCall.name}`);
-            this.outputChannel.appendLine(`  Full arguments: ${toolCall.arguments}`);
-            args = {}; // Fallback to empty args
-          }
-
-          progress.report(new vscode.LanguageModelToolCallPart(
-            toolCall.id,
-            toolCall.name,
-            args as object
-          ));
-        }
-      }
-    }
-
-    this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalToolCalls} tool calls`);
   }
 
   /**
@@ -860,7 +813,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     if (options.modelOptions) {
-      Object.assign(requestOptions, options.modelOptions);
+      const allowedKeys = ['temperature', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'stop', 'seed'];
+      for (const key of allowedKeys) {
+        if (key in options.modelOptions && (options.modelOptions as Record<string, unknown>)[key] !== undefined) {
+          (requestOptions as Record<string, unknown>)[key] = (options.modelOptions as Record<string, unknown>)[key];
+        }
+      }
     }
 
     // Log request (sanitized)
@@ -883,9 +841,40 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     try {
       let totalContent = '';
       let totalToolCalls = 0;
+      const idleTimeout = this.config.streamingIdleTimeout;
+      const iterator = this.client.streamChatCompletion(
+        requestOptions as unknown as OpenAIChatCompletionRequest,
+        token,
+        this.config.maxRetries,
+        this.config.retryDelay
+      )[Symbol.asyncIterator]();
 
-      for await (const chunk of this.client.streamChatCompletion(requestOptions as unknown as OpenAIChatCompletionRequest, token)) {
+      while (true) {
         if (token.isCancellationRequested) { break; }
+
+        let result: IteratorResult<any>;
+        if (idleTimeout > 0) {
+          let timeoutId: ReturnType<typeof setTimeout> | undefined;
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error('Streaming idle timeout')), idleTimeout);
+          });
+          try {
+            result = await Promise.race([iterator.next(), timeoutPromise]);
+          } catch (e: any) {
+            if (e.message === 'Streaming idle timeout') {
+              this.outputChannel.appendLine(`WARNING: Streaming idle timeout after ${idleTimeout}ms`);
+              break;
+            }
+            throw e;
+          } finally {
+            if (timeoutId !== undefined) { clearTimeout(timeoutId); }
+          }
+        } else {
+          result = await iterator.next();
+        }
+
+        if (result.done) { break; }
+        const chunk = result.value;
 
         if (chunk.content) {
           totalContent += chunk.content;
@@ -939,23 +928,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return estimatedTokens;
   }
 
-  /**
-   * Show a timed notification with a link to settings (once per session)
-   */
   private showWelcomeNotification(modelId: string): void {
-    if (this.hasShownWelcomeNotification) {
-      return;
+    if (!this.statusBarItem) {
+      this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+      this.statusBarItem.command = 'workbench.action.openSettings';
+      this.context.subscriptions.push(this.statusBarItem);
     }
-    this.hasShownWelcomeNotification = true;
-
-    vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: `LLM Gateway: ${modelId}  —  [Settings](command:workbench.action.openSettings?%22github.copilot.llm-gateway%22)`,
-        cancellable: false,
-      },
-      () => new Promise((resolve) => setTimeout(resolve, 3000))
-    );
+    this.statusBarItem.text = `$(hubot) LLM: ${modelId}`;
+    this.statusBarItem.tooltip = 'GitHub Copilot LLM Gateway - Click to open settings';
+    this.statusBarItem.show();
   }
 
   /**
@@ -973,6 +954,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       agentTemperature: config.get<number>('agentTemperature', 0),
+      toolExcludePatterns: config.get<string[]>('toolExcludePatterns', ['^search_view_results$', '^view_results$', '^vscode_internal', '^extension_', '^unknown_']),
+      streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 30000),
+      maxRetries: config.get<number>('maxRetries', 2),
+      retryDelay: config.get<number>('retryDelay', 1000),
     };
 
     // Validate requestTimeout
@@ -981,12 +966,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       cfg.requestTimeout = 60000;
     }
 
-    // Validate serverUrl format
     try {
-      const parsed = new URL(cfg.serverUrl);
-      if (this.isPrivateIP(parsed.hostname)) {
-        this.outputChannel.appendLine(`WARNING: Server URL points to private network: ${cfg.serverUrl}`);
-      }
+      new URL(cfg.serverUrl);
     } catch {
       this.outputChannel.appendLine(`ERROR: Invalid server URL: ${cfg.serverUrl}`);
       throw new Error(`Invalid server URL: ${cfg.serverUrl}`);
@@ -1007,27 +988,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return cfg;
   }
 
-  /**
-   * Check if hostname is a private IP
-   */
-  private isPrivateIP(hostname: string): boolean {
-    const privatePatterns = [
-      /^localhost$/i,
-      /^127\./,
-      /^10\./,
-      /^172\.(1[6-9]|2[0-9]|3[01])\./,
-      /^192\.168\./,
-      /^::1$/,
-      /^fe80:/i,
-      /^fc00:/i,
-      /^fd00:/i
-    ];
-    return privatePatterns.some(pattern => pattern.test(hostname));
+  private dispose(): void {
+    this.statusBarItem?.dispose();
   }
 
-  /**
-   * Reload configuration and update client
-   */
   private reloadConfig(): void {
     this.config = this.loadConfig();
     this.client.updateConfig(this.config);
