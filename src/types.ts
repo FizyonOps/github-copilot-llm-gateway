@@ -94,4 +94,8 @@ export interface GatewayConfig {
   enableToolCalling: boolean;
   parallelToolCalling: boolean;
   agentTemperature: number;
+  toolExcludePatterns: string[];
+  streamingIdleTimeout: number;
+  maxRetries: number;
+  retryDelay: number;
 }
