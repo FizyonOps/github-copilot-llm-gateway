@@ -7,6 +7,9 @@ export interface OpenAIModel {
   object: string;
   created: number;
   owned_by: string;
+  max_model_len?: number;
+  context_length?: number;
+  max_context_length?: number;
 }
 
 export interface OpenAIModelsResponse {

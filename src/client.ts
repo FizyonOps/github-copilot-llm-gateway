@@ -98,6 +98,28 @@ export class GatewayClient {
   }
 
   /**
+   * Fetch detailed information for a specific model
+   */
+  public async fetchModelDetails(modelId: string): Promise<OpenAIModel | null> {
+    const url = `${this.config.serverUrl}/v1/models/${encodeURIComponent(modelId)}`;
+
+    try {
+      const response = await this.fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      return await response.json();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
    * Create initial tool call tracking state
    */
   private createToolCallState(): ToolCallState {

@@ -13,6 +13,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
   // Track if we've shown the welcome notification this session
   private hasShownWelcomeNotification = false;
+  // Cache model metadata
+  private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.outputChannel = vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
@@ -496,21 +498,45 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine('Fetching models from inference server...');
       const response = await this.client.fetchModels();
 
-      const models = response.data.map((model) => {
+      const models: vscode.LanguageModelChatInformation[] = [];
+
+      for (const model of response.data) {
+        let maxTokens = this.config.defaultMaxTokens;
+        let maxOutputTokens = this.config.defaultMaxOutputTokens;
+
+        const contextSize = model.max_model_len || model.context_length || model.max_context_length;
+        if (contextSize && contextSize > 0) {
+          maxTokens = contextSize;
+          maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(contextSize / 2));
+          this.outputChannel.appendLine(`  ${model.id}: detected context=${contextSize}, max_output=${maxOutputTokens}`);
+        } else {
+          const details = await this.client.fetchModelDetails(model.id);
+          if (details) {
+            const detailContextSize = details.max_model_len || details.context_length || details.max_context_length;
+            if (detailContextSize && detailContextSize > 0) {
+              maxTokens = detailContextSize;
+              maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(detailContextSize / 2));
+              this.outputChannel.appendLine(`  ${model.id}: fetched context=${detailContextSize}, max_output=${maxOutputTokens}`);
+            }
+          }
+        }
+
+        this.modelMetadata.set(model.id, { maxTokens, maxOutputTokens });
+
         const modelInfo: vscode.LanguageModelChatInformation = {
           id: model.id,
           name: model.id,
           family: 'llm-gateway',
-          maxInputTokens: this.config.defaultMaxTokens,
-          maxOutputTokens: this.config.defaultMaxOutputTokens,
+          maxInputTokens: maxTokens,
+          maxOutputTokens: maxOutputTokens,
           version: '1.0.0',
           capabilities: {
             toolCalling: this.config.enableToolCalling
           },
         };
 
-        return modelInfo;
-      });
+        models.push(modelInfo);
+      }
 
       this.outputChannel.appendLine(`Found ${models.length} models: ${models.map(m => m.id).join(', ')}`);
       return models;
@@ -594,14 +620,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   /**
    * Calculate safe max output tokens based on input estimate
    */
-  private calculateSafeMaxOutputTokens(estimatedInputTokens: number, toolsOverhead: number): number {
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
+  private calculateSafeMaxOutputTokens(modelId: string, estimatedInputTokens: number, toolsOverhead: number): number {
+    const metadata = this.modelMetadata.get(modelId);
+    const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
+    const modelMaxOutput = metadata?.maxOutputTokens || this.config.defaultMaxOutputTokens || 2048;
+    
     const totalEstimatedTokens = estimatedInputTokens + toolsOverhead;
     const conservativeInputEstimate = Math.ceil(totalEstimatedTokens * 1.2);
     const bufferTokens = 256;
 
     let safeMaxOutputTokens = Math.min(
-      this.config.defaultMaxOutputTokens || 2048,
+      modelMaxOutput,
       Math.floor(modelMaxContext - conservativeInputEstimate - bufferTokens)
     );
 
@@ -773,9 +802,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
     }
 
-    // Calculate token limits and truncate
-    const modelMaxContext = this.config.defaultMaxTokens || 32768;
-    const desiredOutputTokens = Math.min(this.config.defaultMaxOutputTokens || 2048, Math.floor(modelMaxContext / 2));
+    // Calculate token limits and truncate using model-specific metadata
+    const metadata = this.modelMetadata.get(model.id);
+    const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
+    const modelMaxOutput = metadata?.maxOutputTokens || this.config.defaultMaxOutputTokens || 2048;
+    
+    const desiredOutputTokens = Math.min(modelMaxOutput, Math.floor(modelMaxContext / 2));
     const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
     const maxInputTokens = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
 
@@ -795,15 +827,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     const toolsOverhead = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4) : 0;
     const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
-    const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(estimatedInputTokens, toolsOverhead);
+    const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(model.id, estimatedInputTokens, toolsOverhead);
 
     this.outputChannel.appendLine(
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
     );
 
-    // Build request
+    // Build request with dynamic temperature
     const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
-    const temperature = hasTools ? (this.config.agentTemperature ?? 0) : 0.7;
+    let temperature = 0.7;
+    if (hasTools) {
+      temperature = this.config.agentTemperature ?? 0;
+    } else if (options.modelOptions && typeof options.modelOptions.temperature === 'number') {
+      temperature = options.modelOptions.temperature;
+    }
 
     const requestOptions: Record<string, unknown> = {
       model: model.id,
