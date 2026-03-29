@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import {
   OpenAIChatCompletionRequest,
   OpenAIModelsResponse,
+  OpenAIModel,
   GatewayConfig
 } from './types';
 
@@ -23,9 +24,6 @@ interface ToolCallState {
   finalizedIndices: Set<number>;
   requestId: string;
   toolCallCounter: number;
-
-  // Add error handling for SSE events
-  handleSSEError(error: Error): void;
 }
 
 /**
@@ -353,21 +351,46 @@ export class GatewayClient {
    */
   public async *streamChatCompletion(
     request: OpenAIChatCompletionRequest,
-    cancellationToken: vscode.CancellationToken
+    cancellationToken: vscode.CancellationToken,
+    maxRetries: number = 0,
+    retryDelay: number = 1000
   ): AsyncGenerator<{ content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
     const url = `${this.config.serverUrl}/v1/chat/completions`;
     const state = this.createToolCallState();
 
     try {
-      const response = await this.fetch(url, {
-        method: 'POST',
-        headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...request, stream: true }),
-      });
+      let response: Response | undefined;
+      let lastError: Error | undefined;
 
-      if (!response.ok) {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (cancellationToken.isCancellationRequested) {
+          throw new Error('Request cancelled');
+        }
+
+        response = await this.fetch(url, {
+          method: 'POST',
+          headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...request, stream: true }),
+        });
+
+        if (response.ok) {
+          break;
+        }
+
         const errorText = await response.text();
-        throw new Error(`Chat completion failed: ${response.status} ${response.statusText} - ${errorText}`);
+        lastError = new Error(`Chat completion failed: ${response.status} ${response.statusText} - ${errorText}`);
+
+        if (response.status < 500 || attempt === maxRetries) {
+          throw lastError;
+        }
+
+        const delay = retryDelay * Math.pow(2, attempt);
+        console.warn(`[LLM Gateway] Retry ${attempt + 1}/${maxRetries} after ${response.status}, next attempt in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+
+      if (!response || !response.ok) {
+        throw lastError || new Error('Chat completion failed');
       }
 
       if (!response.body) {
@@ -397,7 +420,9 @@ export class GatewayClient {
 
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length > MAX_BUFFER_SIZE) {
-          buffer = buffer.slice(-500000);
+          const truncated = buffer.slice(-MAX_BUFFER_SIZE);
+          const firstNewline = truncated.indexOf('\n');
+          buffer = firstNewline >= 0 ? truncated.slice(firstNewline + 1) : truncated;
         }
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
