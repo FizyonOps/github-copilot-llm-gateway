@@ -120,6 +120,15 @@ export class GatewayClient {
     const existing = state.toolCallsByIndex.get(index);
 
     if (existing) {
+      if (tc.id && existing.id && tc.id !== existing.id) {
+        const newIndex = state.toolCallCounter++;
+        state.toolCallsByIndex.set(newIndex, {
+          id: tc.id,
+          name: tc.function?.name || '',
+          arguments: tc.function?.arguments || '',
+        });
+        return;
+      }
       if (tc.id) { existing.id = tc.id; }
       if (tc.function?.name) { existing.name = tc.function.name; }
       if (tc.function?.arguments) { existing.arguments += tc.function.arguments; }
@@ -255,8 +264,7 @@ export class GatewayClient {
         finishReason: parsed.choices?.[0]?.finish_reason,
         id: parsed.id,
       };
-    } catch {
-      console.error('Failed to parse SSE chunk:', data);
+    } catch (parseError) {
       return null;
     }
   }
@@ -345,12 +353,20 @@ export class GatewayClient {
       }
 
       const reader = response.body.getReader();
+      if (!reader) {
+        throw new Error('Response reader is null');
+      }
       const decoder = new TextDecoder();
       let buffer = '';
+      const MAX_BUFFER_SIZE = 1024 * 1024;
 
       while (true) {
         if (cancellationToken.isCancellationRequested) {
-          reader.cancel();
+          try {
+            await reader.cancel();
+          } catch (cancelError) {
+            console.error('Failed to cancel reader:', cancelError);
+          }
           break;
         }
 
@@ -358,6 +374,9 @@ export class GatewayClient {
         if (done) { break; }
 
         buffer += decoder.decode(value, { stream: true });
+        if (buffer.length > MAX_BUFFER_SIZE) {
+          buffer = buffer.slice(-500000);
+        }
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
@@ -386,7 +405,7 @@ export class GatewayClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {};
 
-    if (this.config.apiKey) {
+    if (this.config.apiKey && this.config.apiKey.trim() !== '') {
       headers['Authorization'] = `Bearer ${this.config.apiKey}`;
     }
 

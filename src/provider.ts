@@ -24,7 +24,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       vscode.workspace.onDidChangeConfiguration((e: vscode.ConfigurationChangeEvent) => {
         if (e.affectsConfiguration('github.copilot.llm-gateway')) {
           this.outputChannel.appendLine('Configuration changed, reloading...');
-          this.reloadConfig();
+          try {
+            this.reloadConfig();
+          } catch (error) {
+            this.outputChannel.appendLine(`ERROR: Failed to reload config: ${error}`);
+            vscode.window.showErrorMessage('Failed to reload LLM Gateway configuration. Check settings.');
+          }
         }
       })
     );
@@ -136,22 +141,79 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     options: vscode.ProvideLanguageModelChatResponseOptions
   ): void {
     if (this.config.enableToolCalling && options.tools && options.tools.length > 0) {
-      requestOptions.tools = options.tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.inputSchema,
-        },
-      }));
+      const validTools = this.filterValidTools(options.tools);
 
-      if (options.toolMode !== undefined) {
-        requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
+      if (validTools.length > 0) {
+        requestOptions.tools = validTools.map((tool) => ({
+          type: 'function',
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.inputSchema,
+          },
+        }));
+
+        if (options.toolMode !== undefined) {
+          requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
+        }
+
+        requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
+        this.outputChannel.appendLine(`Sending ${requestOptions.tools.length} valid tools to model (parallel: ${this.config.parallelToolCalling})`);
+        if (options.tools.length > validTools.length) {
+          this.outputChannel.appendLine(`Filtered out ${options.tools.length - validTools.length} invalid/disabled tools`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Filter out invalid, disabled, or unsupported tools
+   * VS Code may pass tools that don't exist or aren't properly configured
+   */
+  private filterValidTools(tools: readonly (vscode.LanguageModelToolInformation | vscode.LanguageModelChatTool)[]): (vscode.LanguageModelToolInformation | vscode.LanguageModelChatTool)[] {
+    const validTools: (vscode.LanguageModelToolInformation | vscode.LanguageModelChatTool)[] = [];
+
+    for (const tool of tools) {
+      // Skip tools without a name
+      if (!tool.name || tool.name.trim() === '') {
+        this.outputChannel.appendLine(`  FILTERED: Tool without name`);
+        continue;
       }
 
-      requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
-      this.outputChannel.appendLine(`Sending ${requestOptions.tools.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
+      // Skip tools with missing or invalid input schema
+      if (!tool.inputSchema) {
+        this.outputChannel.appendLine(`  FILTERED: ${tool.name} - missing input schema`);
+        continue;
+      }
+
+      // Skip tools with invalid JSON schema (common with broken MCP tools)
+      try {
+        const schemaStr = JSON.stringify(tool.inputSchema);
+        JSON.parse(schemaStr);
+      } catch (e) {
+        this.outputChannel.appendLine(`  FILTERED: ${tool.name} - invalid JSON schema: ${e}`);
+        continue;
+      }
+
+      // Skip tools that look like broken internal VS Code tools
+      // These often appear as "search_view_results" and similar internal references
+      const brokenToolPatterns = [
+        'search_view_results',
+        'view_results',
+        'vscode_internal',
+        'extension_',
+        'unknown_',
+      ];
+
+      if (brokenToolPatterns.some(pattern => tool.name.toLowerCase().includes(pattern))) {
+        this.outputChannel.appendLine(`  FILTERED: ${tool.name} - appears to be a broken internal tool`);
+        continue;
+      }
+
+      validTools.push(tool);
     }
+
+    return validTools;
   }
 
   /**
@@ -270,8 +332,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Always keep the first message if it exists (usually system prompt)
     if (messages.length > 0) {
-      result.push(messages[0]);
-      usedTokens += messageTokens[0];
+      if (messageTokens[0] <= maxTokens) {
+        result.push(messages[0]);
+        usedTokens += messageTokens[0];
+      } else {
+        this.outputChannel.appendLine(`WARNING: First message exceeds token limit (${messageTokens[0]} > ${maxTokens}). Including anyway.`);
+        result.push(messages[0]);
+        usedTokens += messageTokens[0];
+      }
     }
 
     // Work backwards from the end, adding messages until we hit the limit
@@ -355,10 +423,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     try {
-      return JSON.parse(repaired);
+      const result = JSON.parse(repaired);
+      if (repaired !== jsonStr) {
+        this.outputChannel.appendLine(`JSON repaired successfully`);
+      }
+      return result;
     } catch {
-      this.outputChannel.appendLine(`JSON repair failed. Original: ${jsonStr}`);
-      this.outputChannel.appendLine(`Repaired attempt: ${repaired}`);
+      this.outputChannel.appendLine(`JSON repair failed. Original length: ${jsonStr.length}`);
+      this.outputChannel.appendLine(`Original: ${jsonStr.substring(0, 500)}${jsonStr.length > 500 ? '...' : ''}`);
       return null;
     }
   }
@@ -369,6 +441,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
+    this.currentToolSchemas.clear();
     this.outputChannel.appendLine(`Streaming chat completion...`);
     let totalContent = '';
     let totalToolCalls = 0;
@@ -545,7 +618,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     this.currentToolSchemas.clear();
 
-    return options.tools.map((tool) => {
+    const validTools = this.filterValidTools(options.tools);
+
+    if (validTools.length === 0) {
+      return undefined;
+    }
+
+    return validTools.map((tool) => {
       this.outputChannel.appendLine(`Tool: ${tool.name}`);
       this.outputChannel.appendLine(`  Description: ${tool.description?.substring(0, 100) || 'none'}...`);
 
@@ -747,8 +826,21 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       Object.assign(requestOptions, options.modelOptions);
     }
 
-    // Log request
-    const debugRequest = JSON.stringify(requestOptions, null, 2);
+    // Log request (sanitized)
+    const sanitizedRequest = { ...requestOptions };
+    if (sanitizedRequest.messages && Array.isArray(sanitizedRequest.messages)) {
+      sanitizedRequest.messages = sanitizedRequest.messages.map((msg: any) => {
+        if (typeof msg === 'object' && msg !== null) {
+          const sanitized = { ...msg };
+          if (sanitized.content && typeof sanitized.content === 'string' && sanitized.content.length > 200) {
+            sanitized.content = sanitized.content.substring(0, 200) + '...[truncated]';
+          }
+          return sanitized;
+        }
+        return msg;
+      });
+    }
+    const debugRequest = JSON.stringify(sanitizedRequest, null, 2);
     this.outputChannel.appendLine(debugRequest.length > 2000 ? `Request (truncated): ${debugRequest.substring(0, 2000)}...` : `Request: ${debugRequest}`);
 
     try {
@@ -789,6 +881,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     text: string | vscode.LanguageModelChatMessage,
     token: vscode.CancellationToken
   ): Promise<number> {
+    if (token.isCancellationRequested) {
+      return 0;
+    }
     // Simple approximation: ~4 characters per token
     // This is a rough estimate; for more accuracy, could use tiktoken library
     let content: string;
@@ -851,7 +946,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Validate serverUrl format
     try {
-      new URL(cfg.serverUrl);
+      const parsed = new URL(cfg.serverUrl);
+      if (this.isPrivateIP(parsed.hostname)) {
+        this.outputChannel.appendLine(`WARNING: Server URL points to private network: ${cfg.serverUrl}`);
+      }
     } catch {
       this.outputChannel.appendLine(`ERROR: Invalid server URL: ${cfg.serverUrl}`);
       throw new Error(`Invalid server URL: ${cfg.serverUrl}`);
@@ -870,6 +968,24 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     return cfg;
+  }
+
+  /**
+   * Check if hostname is a private IP
+   */
+  private isPrivateIP(hostname: string): boolean {
+    const privatePatterns = [
+      /^localhost$/i,
+      /^127\./,
+      /^10\./,
+      /^172\.(1[6-9]|2[0-9]|3[01])\./,
+      /^192\.168\./,
+      /^::1$/,
+      /^fe80:/i,
+      /^fc00:/i,
+      /^fd00:/i
+    ];
+    return privatePatterns.some(pattern => pattern.test(hostname));
   }
 
   /**

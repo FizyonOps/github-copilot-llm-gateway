@@ -5,7 +5,8 @@ import { GatewayProvider } from './provider';
  * Extension activation
  */
 export function activate(context: vscode.ExtensionContext) {
-  console.log('GitHub Copilot LLM Gateway extension is now active');
+  const outputChannel = vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
+  outputChannel.appendLine('GitHub Copilot LLM Gateway extension is now active');
 
   // Create and register the language model provider
   const provider = new GatewayProvider(context);
@@ -45,13 +46,14 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(testCommand);
+  context.subscriptions.push(outputChannel);
 
-  console.log('Copilot LLM Gateway provider registered with vendor ID: copilot-llm-gateway');
+  outputChannel.appendLine('Copilot LLM Gateway provider registered with vendor ID: copilot-llm-gateway');
 }
 
 /**
  * Extension deactivation
  */
 export function deactivate() {
-  console.log('GitHub Copilot LLM Gateway extension is now deactivated');
+  // Cleanup handled by context.subscriptions
 }
