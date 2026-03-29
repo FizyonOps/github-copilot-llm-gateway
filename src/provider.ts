@@ -13,8 +13,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
   private statusBarItem: vscode.StatusBarItem | undefined;
   private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
-  constructor(private readonly context: vscode.ExtensionContext) {
-    this.outputChannel = vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
+  constructor(private readonly context: vscode.ExtensionContext, outputChannel?: vscode.OutputChannel) {
+    this.outputChannel = outputChannel ?? vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
     this.config = this.loadConfig();
     this.client = new GatewayClient(this.config);
 
@@ -32,6 +32,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       })
     );
+  }
+
+  refreshModels(): void {
+    this.modelMetadata.clear();
+    this.outputChannel.appendLine('Model metadata cache cleared');
+    vscode.window.showInformationMessage('GitHub Copilot LLM Gateway: Models refreshed');
   }
 
   /**
