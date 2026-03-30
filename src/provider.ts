@@ -653,8 +653,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
 
         if (serverContextSize && serverContextSize > 0) {
-          maxTokens = Math.max(serverContextSize, this.config.defaultMaxTokens);
-          this.outputChannel.appendLine(`  ${model.id}: server_context=${serverContextSize}, config_default=${this.config.defaultMaxTokens}, using=${maxTokens}`);
+          maxTokens = serverContextSize;
+          this.outputChannel.appendLine(`  ${model.id}: server_context=${serverContextSize}, using=${maxTokens}`);
         }
         maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(maxTokens / 2));
 
