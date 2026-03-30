@@ -32,6 +32,7 @@ interface ToolCallState {
 interface ParsedChunk {
   delta?: {
     content?: string;
+    reasoning_content?: string;
     tool_calls?: Array<{
       index?: number;
       id?: string;
@@ -41,6 +42,7 @@ interface ParsedChunk {
   };
   message?: {
     content?: string;
+    reasoning_content?: string;
     text?: string;
     tool_calls?: Array<{
       index?: number;
@@ -209,7 +211,7 @@ export class GatewayClient {
   private processDeltaFormat(
     parsed: ParsedChunk,
     state: ToolCallState
-  ): { content: string; finishedToolCalls: StreamingToolCall[] } {
+  ): { content: string; reasoning_content: string; finishedToolCalls: StreamingToolCall[] } {
     const delta = parsed.delta!;
     const finishedToolCalls: StreamingToolCall[] = [];
 
@@ -230,7 +232,7 @@ export class GatewayClient {
       finishedToolCalls.push(...this.finalizeToolCalls(state));
     }
 
-    return { content: delta.content || '', finishedToolCalls };
+    return { content: delta.content || '', reasoning_content: delta.reasoning_content || '', finishedToolCalls };
   }
 
   /**
@@ -239,7 +241,7 @@ export class GatewayClient {
   private processMessageFormat(
     parsed: ParsedChunk,
     state: ToolCallState
-  ): { content: string; finishedToolCalls: StreamingToolCall[] } {
+  ): { content: string; reasoning_content: string; finishedToolCalls: StreamingToolCall[] } {
     const message = parsed.message!;
     const finishedToolCalls: StreamingToolCall[] = [];
 
@@ -269,7 +271,7 @@ export class GatewayClient {
       });
     }
 
-    return { content: message.content || message.text || '', finishedToolCalls };
+    return { content: message.content || message.text || '', reasoning_content: message.reasoning_content || '', finishedToolCalls };
   }
 
   /**
@@ -295,7 +297,7 @@ export class GatewayClient {
   private processSSELine(
     line: string,
     state: ToolCallState
-  ): { content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] } | null {
+  ): { content: string; reasoning_content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] } | null {
     const trimmed = line.trim();
 
     if (trimmed === '' || trimmed === 'data: [DONE]') {
@@ -311,13 +313,13 @@ export class GatewayClient {
     if (!parsed) { return null; }
 
     if (parsed.delta) {
-      const { content, finishedToolCalls } = this.processDeltaFormat(parsed, state);
-      return { content, tool_calls: [], finished_tool_calls: finishedToolCalls };
+      const { content, reasoning_content, finishedToolCalls } = this.processDeltaFormat(parsed, state);
+      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls };
     }
 
     if (parsed.message) {
-      const { content, finishedToolCalls } = this.processMessageFormat(parsed, state);
-      return { content, tool_calls: [], finished_tool_calls: finishedToolCalls };
+      const { content, reasoning_content, finishedToolCalls } = this.processMessageFormat(parsed, state);
+      return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls };
     }
 
     return null;
@@ -354,7 +356,7 @@ export class GatewayClient {
     cancellationToken: vscode.CancellationToken,
     maxRetries: number = 0,
     retryDelay: number = 1000
-  ): AsyncGenerator<{ content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
+  ): AsyncGenerator<{ content: string; reasoning_content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
     const url = `${this.config.serverUrl}/v1/chat/completions`;
     const state = this.createToolCallState();
 
@@ -447,7 +449,7 @@ export class GatewayClient {
       // Finalize any remaining tool calls
       const remaining = this.getRemainingToolCalls(state);
       if (remaining.length > 0) {
-        yield { content: '', tool_calls: [], finished_tool_calls: remaining };
+        yield { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: remaining };
       }
     } catch (error) {
       if (error instanceof Error) {

@@ -1067,6 +1067,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     try {
       let totalContent = '';
       let totalToolCalls = 0;
+      let reasoningContent = '';
+      let reasoningEmitted = false;
       const idleTimeout = this.config.streamingIdleTimeout;
       const iterator = this.client.streamChatCompletion(
         requestOptions as unknown as OpenAIChatCompletionRequest,
@@ -1102,6 +1104,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         if (result.done) { break; }
         const chunk = result.value;
 
+        if (chunk.reasoning_content) {
+          reasoningContent += chunk.reasoning_content;
+        }
+
+        if (!reasoningEmitted && reasoningContent && (chunk.content || chunk.finished_tool_calls?.length)) {
+          reasoningEmitted = true;
+          const reasoningBlock = `<details>\n<summary>Thinking...</summary>\n\n${reasoningContent}\n</details>\n\n`;
+          progress.report(new vscode.LanguageModelTextPart(reasoningBlock));
+          this.outputChannel.appendLine(`Emitted reasoning content (${reasoningContent.length} chars)`);
+        }
+
         if (chunk.content) {
           totalContent += chunk.content;
           progress.report(new vscode.LanguageModelTextPart(chunk.content));
@@ -1113,6 +1126,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
             this.processToolCall(toolCall, progress);
           }
         }
+      }
+
+      if (!reasoningEmitted && reasoningContent) {
+        reasoningEmitted = true;
+        const reasoningBlock = `<details>\n<summary>Thinking...</summary>\n\n${reasoningContent}\n</details>\n\n`;
+        progress.report(new vscode.LanguageModelTextPart(reasoningBlock));
+        this.outputChannel.appendLine(`Emitted final reasoning content (${reasoningContent.length} chars)`);
       }
 
       this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalToolCalls} tool calls`);
