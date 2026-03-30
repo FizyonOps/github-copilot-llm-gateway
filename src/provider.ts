@@ -13,6 +13,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
   private statusBarItem: vscode.StatusBarItem | undefined;
   private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
+
   constructor(private readonly context: vscode.ExtensionContext, outputChannel?: vscode.OutputChannel) {
     this.outputChannel = outputChannel ?? vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
     this.config = this.loadConfig();
@@ -447,6 +448,186 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Estimate token overhead for tool results in conversation history
+   * Tool results often contain large file contents, search results, terminal outputs
+   */
+  private estimateToolResultOverhead(messages: any[]): number {
+    let overhead = 0;
+
+    for (const msg of messages) {
+      if (msg.role === 'tool' && msg.content) {
+        // Tool results are often large - estimate generously
+        const contentLength = typeof msg.content === 'string'
+          ? msg.content.length
+          : JSON.stringify(msg.content).length;
+
+        // Tool results have higher token density (~3 chars/token due to structured data)
+        overhead += Math.ceil(contentLength / 3);
+      }
+
+      // Tool calls in assistant messages
+      if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+        overhead += msg.tool_calls.length * 50; // ~50 tokens per tool call metadata
+      }
+    }
+
+    return overhead;
+  }
+
+  /**
+   * Predict whether a request will exceed context limits BEFORE sending
+   * This allows proactive truncation instead of waiting for timeout/failure
+   */
+  private predictContextOverflow(
+    messages: any[],
+    tools: readonly any[],
+    modelId: string
+  ): { willOverflow: boolean; estimatedTotalTokens: number; contextLimit: number; warningLevel: 'none' | 'warning' | 'critical'; recommendedAction: string; messageCount: number; toolOverhead: number } {
+    const metadata = this.modelMetadata.get(modelId);
+    const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
+
+    // Step 1: Estimate input message tokens
+    let messageTokens = 0;
+    for (const msg of messages) {
+      messageTokens += this.estimateMessageTokens(msg);
+    }
+
+    // Step 2: Estimate tool schema overhead
+    const toolsSchema = tools.map((tool: any) => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema
+      }
+    }));
+    const toolsOverhead = Math.ceil(JSON.stringify(toolsSchema).length / 4);
+
+    // Step 3: Estimate tool result overhead from history
+    const toolResultOverhead = this.estimateToolResultOverhead(messages);
+
+    // Step 4: Calculate total expected tokens
+    const totalEstimatedTokens = messageTokens + toolsOverhead + toolResultOverhead;
+
+    // Step 5: Determine warning level
+    const warningThreshold = this.config.contextWarningThreshold || 80;
+    const hardLimit = this.config.contextHardLimit || 95;
+
+    const usagePercent = (totalEstimatedTokens / modelMaxContext) * 100;
+    let warningLevel: 'none' | 'warning' | 'critical' = 'none';
+    let willOverflow = false;
+    let recommendedAction = 'None - within safe limits';
+
+    if (usagePercent >= hardLimit) {
+      warningLevel = 'critical';
+      willOverflow = true;
+      recommendedAction = 'Aggressive truncation required - remove oldest messages and large tool results';
+    } else if (usagePercent >= warningThreshold) {
+      warningLevel = 'warning';
+      recommendedAction = 'Consider truncation - keep recent context only';
+    }
+
+    this.outputChannel.appendLine(`Context prediction: ${totalEstimatedTokens} tokens / ${modelMaxContext} limit (${usagePercent.toFixed(1)}%)`);
+    this.outputChannel.appendLine(`  Message tokens: ${messageTokens}`);
+    this.outputChannel.appendLine(`  Tools overhead: ${toolsOverhead}`);
+    this.outputChannel.appendLine(`  Tool results: ${toolResultOverhead}`);
+    this.outputChannel.appendLine(`  Warning level: ${warningLevel}`);
+
+    return {
+      willOverflow,
+      estimatedTotalTokens: totalEstimatedTokens,
+      contextLimit: modelMaxContext,
+      warningLevel,
+      recommendedAction,
+      messageCount: messages.length,
+      toolOverhead: toolsOverhead + toolResultOverhead
+    };
+  }
+
+  /**
+   * Apply smart truncation strategy based on overflow prediction
+   * Prioritizes keeping: system prompt, recent user messages, important tool results
+   */
+  private applySmartTruncation(
+    messages: any[],
+    prediction: { willOverflow: boolean; estimatedTotalTokens: number; contextLimit: number; warningLevel: 'none' | 'warning' | 'critical'; recommendedAction: string; messageCount: number; toolOverhead: number },
+    modelId: string
+  ): any[] {
+    const metadata = this.modelMetadata.get(modelId);
+    const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
+    const maxMessages = this.config.maxMessageHistory || 50;
+
+    this.outputChannel.appendLine(`Applying smart truncation strategy`);
+    this.outputChannel.appendLine(`  Target: fit within ${modelMaxContext} tokens`);
+    this.outputChannel.appendLine(`  Current: ${prediction.estimatedTotalTokens} tokens across ${messages.length} messages`);
+
+    // Strategy 1: Enforce message count limit
+    let truncated = [...messages];
+    if (truncated.length > maxMessages) {
+      this.outputChannel.appendLine(`  Step 1: Enforce message count limit (${maxMessages} max)`);
+
+      // Keep first message (system) + most recent messages
+      const firstMsg = truncated[0];
+      const recentMsgs = truncated.slice(-maxMessages + 1);
+      truncated = [firstMsg, ...recentMsgs];
+    }
+
+    // Strategy 2: Remove large tool results from middle of history
+    if (prediction.estimatedTotalTokens > modelMaxContext * 0.9) {
+      this.outputChannel.appendLine(`  Step 2: Removing large tool results from older messages`);
+
+      const result = [];
+      let inMiddleRegion = false;
+
+      for (let i = 0; i < truncated.length; i++) {
+        const isSystem = i === 0;
+        const isRecent = i >= truncated.length - 10;
+        const isMiddle = !isSystem && !isRecent;
+
+        if (isMiddle && truncated[i].role === 'tool') {
+          // Skip tool results in middle region to save tokens
+          const contentLen = typeof truncated[i].content === 'string'
+            ? truncated[i].content.length
+            : JSON.stringify(truncated[i].content).length;
+
+          if (contentLen > 1000) {
+            this.outputChannel.appendLine(`    Skipping large tool result (${contentLen} chars)`);
+            continue;
+          }
+        }
+
+        result.push(truncated[i]);
+      }
+
+      truncated = result;
+    }
+
+    // Strategy 3: Compress content in older messages
+    if (prediction.estimatedTotalTokens > modelMaxContext * 0.85) {
+      this.outputChannel.appendLine(`  Step 3: Compressing content in older messages`);
+
+      for (let i = 1; i < truncated.length - 5; i++) {
+        if (truncated[i].content && typeof truncated[i].content === 'string') {
+          const originalLen = truncated[i].content.length;
+          if (originalLen > 5000) {
+            // Summarize long content - keep first and last 500 chars
+            truncated[i].content = truncated[i].content.substring(0, 500) +
+              '\n...[content compressed by LLM Gateway]...\n' +
+              truncated[i].content.substring(originalLen - 500);
+            this.outputChannel.appendLine(`    Compressed message ${i}: ${originalLen} → ${truncated[i].content.length} chars`);
+          }
+        }
+      }
+    }
+
+    // Recalculate after truncation
+    const newTokenEstimate = truncated.reduce((sum, msg) => sum + this.estimateMessageTokens(msg), 0);
+    this.outputChannel.appendLine(`  Result: ${truncated.length} messages, ~${newTokenEstimate} tokens`);
+
+    return truncated;
+  }
+
+  /**
    * Provide language model information - fetches available models from inference server
    */
   async provideLanguageModelChatInformation(
@@ -761,16 +942,38 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
     }
 
-    // Calculate token limits and truncate using model-specific metadata
-    const metadata = this.modelMetadata.get(model.id);
-    const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
-    const modelMaxOutput = metadata?.maxOutputTokens || this.config.defaultMaxOutputTokens || 2048;
+    // Predict context overflow BEFORE sending request
+    const overflowPrediction = this.predictContextOverflow(
+      openAIMessages,
+      options.tools || [],
+      model.id
+    );
 
-    const desiredOutputTokens = Math.min(modelMaxOutput, Math.floor(modelMaxContext / 2));
-    const toolsTokenEstimate = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4 * 1.2) : 0;
-    const maxInputTokens = modelMaxContext - desiredOutputTokens - toolsTokenEstimate - 256;
+    if (overflowPrediction.warningLevel === 'critical') {
+      this.outputChannel.appendLine(`⚠️ CRITICAL: Context overflow predicted before sending request`);
+      this.outputChannel.appendLine(`  Estimated total: ${overflowPrediction.estimatedTotalTokens} tokens`);
+      this.outputChannel.appendLine(`  Limit: ${overflowPrediction.contextLimit} tokens`);
+      this.outputChannel.appendLine(`  Action: ${overflowPrediction.recommendedAction}`);
 
-    const truncatedMessages = this.truncateMessagesToFit(openAIMessages, maxInputTokens);
+      // Show user warning
+      vscode.window.showWarningMessage(
+        `LLM Gateway: Request may exceed context limit (${overflowPrediction.estimatedTotalTokens}/${overflowPrediction.contextLimit} tokens). Gateway will truncate automatically.`,
+        'View Details'
+      ).then((selection) => {
+        if (selection === 'View Details') {
+          this.outputChannel.show();
+        }
+      });
+    }
+
+    // Apply proactive truncation if enabled
+    let messagesToSend = openAIMessages;
+    if (overflowPrediction.willOverflow && this.config.enableProactiveTruncation !== false) {
+      this.outputChannel.appendLine(`Applying proactive truncation: ${overflowPrediction.recommendedAction}`);
+      messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
+    }
+
+    const truncatedMessages = messagesToSend;
     if (truncatedMessages.length < openAIMessages.length) {
       this.outputChannel.appendLine(`WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
     }
@@ -787,6 +990,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const toolsOverhead = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4) : 0;
     const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
     const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(model.id, estimatedInputTokens, toolsOverhead);
+    const modelMaxContext = overflowPrediction.contextLimit;
 
     this.outputChannel.appendLine(
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
@@ -954,16 +1158,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const cfg: GatewayConfig = {
       serverUrl: config.get<string>('serverUrl', 'http://localhost:8000'),
       apiKey: config.get<string>('apiKey', ''),
-      requestTimeout: config.get<number>('requestTimeout', 60000),
+      requestTimeout: config.get<number>('requestTimeout', 300000),
       defaultMaxTokens: config.get<number>('defaultMaxTokens', 32768),
       defaultMaxOutputTokens: config.get<number>('defaultMaxOutputTokens', 4096),
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       agentTemperature: config.get<number>('agentTemperature', 0),
       toolExcludePatterns: config.get<string[]>('toolExcludePatterns', ['^search_view_results$', '^view_results$', '^vscode_internal', '^extension_', '^unknown_']),
-      streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 30000),
+      streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 120000),
       maxRetries: config.get<number>('maxRetries', 2),
       retryDelay: config.get<number>('retryDelay', 1000),
+      contextWarningThreshold: config.get<number>('contextWarningThreshold', 80),
+      contextHardLimit: config.get<number>('contextHardLimit', 95),
+      maxMessageHistory: config.get<number>('maxMessageHistory', 50),
+      enableProactiveTruncation: config.get<boolean>('enableProactiveTruncation', true),
     };
 
     // Validate requestTimeout

@@ -79,8 +79,8 @@
         },
         "github.copilot.llm-gateway.requestTimeout": {
           "type": "number",
-          "default": 60000,
-          "description": "Request timeout in milliseconds",
+          "default": 300000,
+          "description": "Request timeout in milliseconds. Increase for large prompts on local models.",
           "order": 3
         },
         "github.copilot.llm-gateway.defaultMaxTokens": {
@@ -120,14 +120,20 @@
           "items": {
             "type": "string"
           },
-          "default": ["^search_view_results$", "^view_results$", "^vscode_internal", "^extension_", "^unknown_"],
+          "default": [
+            "^search_view_results$",
+            "^view_results$",
+            "^vscode_internal",
+            "^extension_",
+            "^unknown_"
+          ],
           "description": "Regex patterns to exclude tools by name. Each pattern is tested against tool names.",
           "order": 9
         },
         "github.copilot.llm-gateway.streamingIdleTimeout": {
           "type": "number",
-          "default": 30000,
-          "description": "Maximum time in milliseconds to wait for the next streaming chunk before timing out. Set to 0 to disable.",
+          "default": 120000,
+          "description": "Maximum time in milliseconds to wait for the next streaming chunk before timing out. Increase for large prompts on local models where prefill is slow. Set to 0 to disable.",
           "order": 10
         },
         "github.copilot.llm-gateway.maxRetries": {

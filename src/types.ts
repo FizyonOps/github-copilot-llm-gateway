@@ -98,4 +98,8 @@ export interface GatewayConfig {
   streamingIdleTimeout: number;
   maxRetries: number;
   retryDelay: number;
+  contextWarningThreshold: number; // Warn when input tokens exceed this % of limit (default 80)
+  contextHardLimit: number; // Hard cutoff % of context limit (default 95)
+  maxMessageHistory: number; // Maximum messages to keep (default 50)
+  enableProactiveTruncation: boolean; // Truncate before sending if near limit
 }
