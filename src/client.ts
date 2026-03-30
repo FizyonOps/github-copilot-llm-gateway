@@ -387,7 +387,7 @@ export class GatewayClient {
             const parsed = JSON.parse(errorText);
             (ctxError as any).promptTokens = parsed?.error?.n_prompt_tokens;
             (ctxError as any).contextSize = parsed?.error?.n_ctx;
-          } catch {}
+          } catch { }
           throw ctxError;
         }
 

@@ -927,6 +927,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Convert messages
     const openAIMessages: Record<string, unknown>[] = [];
+    if (this.config.systemPrompt) {
+      openAIMessages.push({ role: 'system', content: this.config.systemPrompt });
+      this.outputChannel.appendLine(`Prepended system prompt (${this.config.systemPrompt.length} chars)`);
+    }
     for (const msg of messages) {
       openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
     }
@@ -1218,6 +1222,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 120000),
       maxRetries: config.get<number>('maxRetries', 2),
       retryDelay: config.get<number>('retryDelay', 1000),
+      systemPrompt: config.get<string>('systemPrompt', ''),
       contextWarningThreshold: config.get<number>('contextWarningThreshold', 75),
       contextHardLimit: config.get<number>('contextHardLimit', 85),
       maxMessageHistory: config.get<number>('maxMessageHistory', 50),

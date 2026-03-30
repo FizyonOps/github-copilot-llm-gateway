@@ -147,6 +147,13 @@
           "default": 1000,
           "description": "Base delay in milliseconds between retry attempts. Uses exponential backoff.",
           "order": 12
+        },
+        "github.copilot.llm-gateway.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "System prompt to prepend to every conversation. Leave empty to use the default behavior.",
+          "editPresentation": "multilineText",
+          "order": 13
         }
       }
     }
