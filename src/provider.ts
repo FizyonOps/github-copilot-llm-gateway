@@ -303,8 +303,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (message.tool_calls) {
       text += JSON.stringify(message.tool_calls);
     }
-    // Rough estimate: ~4 characters per token
-    return Math.ceil(text.length / 4);
+    // Conservative estimate: ~3.3 characters per token (closer to real tokenizers)
+    return Math.ceil(text.length / 3.3);
   }
 
   /**
@@ -461,8 +461,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           ? msg.content.length
           : JSON.stringify(msg.content).length;
 
-        // Tool results have higher token density (~3 chars/token due to structured data)
-        overhead += Math.ceil(contentLength / 3);
+        // Tool results have higher token density (~2.8 chars/token due to structured data)
+        overhead += Math.ceil(contentLength / 2.8);
       }
 
       // Tool calls in assistant messages
@@ -506,8 +506,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // Step 3: Estimate tool result overhead from history
     const toolResultOverhead = this.estimateToolResultOverhead(messages);
 
-    // Step 4: Calculate total expected tokens
-    const totalEstimatedTokens = messageTokens + toolsOverhead + toolResultOverhead;
+    // Step 4: Calculate total expected tokens (add 10% safety margin for estimation error)
+    const totalEstimatedTokens = Math.ceil((messageTokens + toolsOverhead + toolResultOverhead) * 1.1);
 
     // Step 5: Determine warning level
     const warningThreshold = this.config.contextWarningThreshold || 80;
@@ -1045,6 +1045,21 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const debugRequest = JSON.stringify(sanitizedRequest, null, 2);
     this.outputChannel.appendLine(debugRequest.length > 2000 ? `Request (truncated): ${debugRequest.substring(0, 2000)}...` : `Request: ${debugRequest}`);
 
+    await this.executeStreamWithRetry(requestOptions, model, openAIMessages, options, token, progress, inputText);
+  }
+
+  private async executeStreamWithRetry(
+    requestOptions: Record<string, unknown>,
+    model: vscode.LanguageModelChatInformation,
+    openAIMessages: Record<string, unknown>[],
+    options: vscode.ProvideLanguageModelChatResponseOptions,
+    token: vscode.CancellationToken,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    inputText: string,
+    retryAttempt: number = 0
+  ): Promise<void> {
+    const maxContextRetries = 2;
+
     try {
       let totalContent = '';
       let totalToolCalls = 0;
@@ -1101,7 +1116,45 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       if (totalContent.length === 0 && totalToolCalls === 0) {
         await this.handleEmptyResponse(model, inputText, openAIMessages.length, requestOptions.tools ? (requestOptions.tools as unknown[]).length : 0, token, progress);
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.isContextOverflow && retryAttempt < maxContextRetries) {
+        const serverPromptTokens = error.promptTokens;
+        const serverContextSize = error.contextSize;
+        this.outputChannel.appendLine(`Context overflow from server: ${serverPromptTokens} prompt tokens > ${serverContextSize} context. Retry ${retryAttempt + 1}/${maxContextRetries}`);
+
+        if (serverContextSize && serverContextSize > 0) {
+          this.modelMetadata.set(model.id, {
+            maxTokens: serverContextSize,
+            maxOutputTokens: Math.min(this.config.defaultMaxOutputTokens, Math.floor(serverContextSize / 2)),
+          });
+        }
+
+        const currentMessages = requestOptions.messages as any[];
+        const targetTokens = (serverContextSize || this.config.defaultMaxTokens) * 0.7;
+        const aggressivelyTruncated = this.truncateMessagesToFit(currentMessages, targetTokens);
+
+        this.outputChannel.appendLine(`Aggressive truncation: ${currentMessages.length} -> ${aggressivelyTruncated.length} messages, target ${targetTokens} tokens`);
+
+        const newInputText = aggressivelyTruncated
+          .map((m: any) => {
+            let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
+            if (m.tool_calls) { text += JSON.stringify(m.tool_calls); }
+            return text;
+          })
+          .join('\n');
+        const toolsOverhead = requestOptions.tools ? Math.ceil(JSON.stringify(requestOptions.tools).length / 3.3) : 0;
+        const newEstimate = await this.provideTokenCount(model, newInputText, token);
+        const newMaxOutput = this.calculateSafeMaxOutputTokens(model.id, newEstimate, toolsOverhead);
+
+        const retryOptions = {
+          ...requestOptions,
+          messages: aggressivelyTruncated,
+          max_tokens: newMaxOutput,
+        };
+
+        return this.executeStreamWithRetry(retryOptions, model, openAIMessages, options, token, progress, newInputText, retryAttempt + 1);
+      }
+
       this.handleChatError(error);
     }
   }
@@ -1117,8 +1170,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (token.isCancellationRequested) {
       return 0;
     }
-    // Simple approximation: ~4 characters per token
-    // This is a rough estimate; for more accuracy, could use tiktoken library
+    // Conservative approximation: ~3.3 characters per token
+    // This is closer to real tokenizer behavior than the common 4 chars/token estimate
     let content: string;
 
     if (typeof text === 'string') {
@@ -1131,7 +1184,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         .join('');
     }
 
-    const estimatedTokens = Math.ceil(content.length / 4);
+    const estimatedTokens = Math.ceil(content.length / 3.3);
     return estimatedTokens;
   }
 
@@ -1165,8 +1218,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 120000),
       maxRetries: config.get<number>('maxRetries', 2),
       retryDelay: config.get<number>('retryDelay', 1000),
-      contextWarningThreshold: config.get<number>('contextWarningThreshold', 80),
-      contextHardLimit: config.get<number>('contextHardLimit', 95),
+      contextWarningThreshold: config.get<number>('contextWarningThreshold', 75),
+      contextHardLimit: config.get<number>('contextHardLimit', 85),
       maxMessageHistory: config.get<number>('maxMessageHistory', 50),
       enableProactiveTruncation: config.get<boolean>('enableProactiveTruncation', true),
     };

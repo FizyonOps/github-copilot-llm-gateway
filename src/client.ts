@@ -380,6 +380,17 @@ export class GatewayClient {
         const errorText = await response.text();
         lastError = new Error(`Chat completion failed: ${response.status} ${response.statusText} - ${errorText}`);
 
+        if (response.status === 400 && errorText.includes('exceed_context_size_error')) {
+          const ctxError = new Error(`Context size exceeded: ${errorText}`);
+          (ctxError as any).isContextOverflow = true;
+          try {
+            const parsed = JSON.parse(errorText);
+            (ctxError as any).promptTokens = parsed?.error?.n_prompt_tokens;
+            (ctxError as any).contextSize = parsed?.error?.n_ctx;
+          } catch {}
+          throw ctxError;
+        }
+
         if (response.status < 500 || attempt === maxRetries) {
           throw lastError;
         }
