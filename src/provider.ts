@@ -651,10 +651,16 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const metadata = this.modelMetadata.get(modelId);
     const modelMaxContext = metadata?.maxTokens || this.config.defaultMaxTokens || 32768;
     const maxMessages = this.config.maxMessageHistory || 50;
+    const warningThreshold = this.config.contextWarningThreshold || 75;
+    const targetUsagePercent = prediction.warningLevel === 'critical'
+      ? Math.max(55, warningThreshold - 15)
+      : Math.max(60, warningThreshold - 5);
+    const targetTokenBudget = Math.max(256, Math.floor(modelMaxContext * (targetUsagePercent / 100)));
 
     this.outputChannel.appendLine(`Applying smart truncation strategy`);
     this.outputChannel.appendLine(`  Target: fit within ${modelMaxContext} tokens`);
     this.outputChannel.appendLine(`  Current: ${prediction.estimatedTotalTokens} tokens across ${messages.length} messages`);
+    this.outputChannel.appendLine(`  Proactive target budget: ${targetTokenBudget} tokens (${targetUsagePercent}% of context)`);
 
     // Strategy 1: Enforce message count limit
     let truncated = [...messages];
@@ -668,11 +674,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     // Strategy 2: Remove large tool results from middle of history
-    if (prediction.estimatedTotalTokens > modelMaxContext * 0.9) {
+    if (prediction.warningLevel !== 'none') {
       this.outputChannel.appendLine(`  Step 2: Removing large tool results from older messages`);
 
       const result = [];
-      let inMiddleRegion = false;
+      const toolResultCharLimit = prediction.warningLevel === 'critical' ? 1000 : 4000;
 
       for (let i = 0; i < truncated.length; i++) {
         const isSystem = i === 0;
@@ -685,7 +691,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
             ? truncated[i].content.length
             : JSON.stringify(truncated[i].content).length;
 
-          if (contentLen > 1000) {
+          if (contentLen > toolResultCharLimit) {
             this.outputChannel.appendLine(`    Skipping large tool result (${contentLen} chars)`);
             continue;
           }
@@ -698,21 +704,31 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     // Strategy 3: Compress content in older messages
-    if (prediction.estimatedTotalTokens > modelMaxContext * 0.85) {
+    if (prediction.warningLevel !== 'none') {
       this.outputChannel.appendLine(`  Step 3: Compressing content in older messages`);
+
+      const compressThreshold = prediction.warningLevel === 'critical' ? 2000 : 3500;
+      const compressTargetTokens = prediction.warningLevel === 'critical' ? 300 : 500;
 
       for (let i = 1; i < truncated.length - 5; i++) {
         if (truncated[i].content && typeof truncated[i].content === 'string') {
           const originalLen = truncated[i].content.length;
-          if (originalLen > 5000) {
-            // Summarize long content - keep first and last 500 chars
-            truncated[i].content = truncated[i].content.substring(0, 500) +
-              '\n...[content compressed by LLM Gateway]...\n' +
-              truncated[i].content.substring(originalLen - 500);
+          if (originalLen > compressThreshold) {
+            truncated[i].content = this.truncateTextToTokenBudget(
+              truncated[i].content,
+              compressTargetTokens,
+              'content'
+            );
             this.outputChannel.appendLine(`    Compressed message ${i}: ${originalLen} → ${truncated[i].content.length} chars`);
           }
         }
       }
+    }
+
+    const estimatedTokensAfterCompaction = truncated.reduce((sum, msg) => sum + this.estimateMessageTokens(msg), 0);
+    if (estimatedTokensAfterCompaction > targetTokenBudget) {
+      this.outputChannel.appendLine(`  Step 4: Trimming to proactive budget`);
+      truncated = this.truncateMessagesToFit(truncated, targetTokenBudget);
     }
 
     // Recalculate after truncation
@@ -1161,8 +1177,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Apply proactive truncation if enabled
     let messagesToSend = openAIMessages;
-    if (overflowPrediction.willOverflow && this.config.enableProactiveTruncation !== false) {
-      this.outputChannel.appendLine(`Applying proactive truncation: ${overflowPrediction.recommendedAction}`);
+    if (overflowPrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
+      this.outputChannel.appendLine(`Applying proactive compaction: ${overflowPrediction.recommendedAction}`);
       messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
     }
 
