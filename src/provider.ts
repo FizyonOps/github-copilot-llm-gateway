@@ -644,22 +644,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         let maxTokens = this.config.defaultMaxTokens;
         let maxOutputTokens = this.config.defaultMaxOutputTokens;
 
-        const contextSize = model.max_model_len || model.context_length || model.max_context_length;
-        if (contextSize && contextSize > 0) {
-          maxTokens = contextSize;
-          maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(contextSize / 2));
-          this.outputChannel.appendLine(`  ${model.id}: detected context=${contextSize}, max_output=${maxOutputTokens}`);
-        } else {
+        let serverContextSize = model.max_model_len || model.context_length || model.max_context_length;
+        if (!serverContextSize || serverContextSize <= 0) {
           const details = await this.client.fetchModelDetails(model.id);
           if (details) {
-            const detailContextSize = details.max_model_len || details.context_length || details.max_context_length;
-            if (detailContextSize && detailContextSize > 0) {
-              maxTokens = detailContextSize;
-              maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(detailContextSize / 2));
-              this.outputChannel.appendLine(`  ${model.id}: fetched context=${detailContextSize}, max_output=${maxOutputTokens}`);
-            }
+            serverContextSize = details.max_model_len || details.context_length || details.max_context_length;
           }
         }
+
+        if (serverContextSize && serverContextSize > 0) {
+          maxTokens = Math.max(serverContextSize, this.config.defaultMaxTokens);
+          this.outputChannel.appendLine(`  ${model.id}: server_context=${serverContextSize}, config_default=${this.config.defaultMaxTokens}, using=${maxTokens}`);
+        }
+        maxOutputTokens = Math.min(this.config.defaultMaxOutputTokens, Math.floor(maxTokens / 2));
 
         this.modelMetadata.set(model.id, { maxTokens, maxOutputTokens });
 
@@ -1209,6 +1206,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private reloadConfig(): void {
     this.config = this.loadConfig();
     this.client.updateConfig(this.config);
-    this.outputChannel.appendLine('Configuration reloaded');
+    this.modelMetadata.clear();
+    this.outputChannel.appendLine('Configuration reloaded, model metadata cache cleared');
   }
 }
