@@ -451,7 +451,10 @@ export class GatewayClient {
       if (remaining.length > 0) {
         yield { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: remaining };
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.isContextOverflow) {
+        throw error;
+      }
       if (error instanceof Error) {
         throw new Error(`Chat completion request failed: ${error.message}`);
       }
