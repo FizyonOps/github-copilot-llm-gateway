@@ -307,6 +307,48 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return Math.ceil(text.length / 3.3);
   }
 
+  private estimateToolsTokens(tools: readonly any[] | undefined): number {
+    if (!tools || tools.length === 0) {
+      return 0;
+    }
+
+    return Math.ceil(JSON.stringify(tools).length / 3.3);
+  }
+
+  private estimatePromptTokens(messages: any[], tools?: readonly any[]): number {
+    return messages.reduce((sum, msg) => sum + this.estimateMessageTokens(msg), 0) + this.estimateToolsTokens(tools);
+  }
+
+  private truncateTextToTokenBudget(text: string, maxTokens: number, label: string): string {
+    const maxChars = Math.max(256, Math.floor(maxTokens * 3.3));
+    if (text.length <= maxChars) {
+      return text;
+    }
+
+    const marker = `\n...[${label} truncated by LLM Gateway]...\n`;
+    const availableChars = Math.max(128, maxChars - marker.length);
+    const headChars = Math.max(64, Math.floor(availableChars / 2));
+    const tailChars = Math.max(64, availableChars - headChars);
+
+    if (text.length <= headChars + tailChars + marker.length) {
+      return text;
+    }
+
+    return text.substring(0, headChars) + marker + text.substring(text.length - tailChars);
+  }
+
+  private sanitizeVisibleContent(text: string): string {
+    return text.replaceAll(/<\/?think>/gi, '');
+  }
+
+  private normalizeReasoningContent(text: string): string {
+    return text
+      .replaceAll(/<\/?think>/gi, '')
+      .replaceAll(/<\/?details>/gi, '')
+      .replaceAll(/<\/?summary>/gi, '')
+      .trim();
+  }
+
   /**
    * Truncate messages to fit within a token limit.
    * Strategy: Keep the first message (usually system prompt) and the most recent messages.
@@ -316,6 +358,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (messages.length === 0) {
       return messages;
     }
+
+    const tokenBudget = Math.max(128, Math.floor(maxTokens));
 
     // Calculate total tokens
     let totalTokens = 0;
@@ -327,43 +371,94 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     // If we're within limits, return as-is
-    if (totalTokens <= maxTokens) {
+    if (totalTokens <= tokenBudget) {
       return messages;
     }
 
-    this.outputChannel.appendLine(`Context overflow: ${totalTokens} tokens > ${maxTokens} limit. Truncating...`);
+    this.outputChannel.appendLine(`Context overflow: ${totalTokens} tokens > ${tokenBudget} limit. Truncating...`);
 
-    // Strategy: Keep first message (system) and as many recent messages as possible
+    // Strategy: Prefer the system prompt if present, then keep as many recent messages as possible.
     const result: any[] = [];
     let usedTokens = 0;
+    let startIndex = 0;
 
-    // Always keep the first message if it exists (usually system prompt)
-    if (messages.length > 0) {
-      if (messageTokens[0] <= maxTokens) {
-        result.push(messages[0]);
-        usedTokens += messageTokens[0];
+    // Preserve a system prompt, but compress it if it would dominate the budget.
+    if (messages[0]?.role === 'system') {
+      startIndex = 1;
+
+      let firstMessage = messages[0];
+      let firstMessageTokens = messageTokens[0];
+      const preferredSystemBudget = Math.max(128, Math.floor(tokenBudget * 0.2));
+
+      if (typeof firstMessage.content === 'string' && firstMessageTokens > preferredSystemBudget) {
+        firstMessage = {
+          ...firstMessage,
+          content: this.truncateTextToTokenBudget(firstMessage.content, preferredSystemBudget, 'system prompt'),
+        };
+        firstMessageTokens = this.estimateMessageTokens(firstMessage);
+        this.outputChannel.appendLine(`Compressed system prompt: ${messageTokens[0]} -> ${firstMessageTokens} tokens`);
+      }
+
+      if (firstMessageTokens < tokenBudget) {
+        result.push(firstMessage);
+        usedTokens += firstMessageTokens;
       } else {
-        this.outputChannel.appendLine(`WARNING: First message exceeds token limit (${messageTokens[0]} > ${maxTokens}). Including anyway.`);
-        result.push(messages[0]);
-        usedTokens += messageTokens[0];
+        this.outputChannel.appendLine(`WARNING: Dropping oversized system prompt after compression (${firstMessageTokens} tokens)`);
       }
     }
 
     // Work backwards from the end, adding messages until we hit the limit
     const recentMessages: any[] = [];
-    for (let i = messages.length - 1; i > 0; i--) {
-      const msgTokens = messageTokens[i];
-      if (usedTokens + msgTokens <= maxTokens) {
-        recentMessages.unshift(messages[i]);
-        usedTokens += msgTokens;
-      } else {
-        // Stop when we can't fit more messages
+    for (let i = messages.length - 1; i >= startIndex; i--) {
+      const remainingBudget = tokenBudget - usedTokens;
+      if (remainingBudget <= 0) {
         break;
       }
+
+      let candidate = messages[i];
+      let candidateTokens = messageTokens[i];
+
+      if (candidateTokens > remainingBudget) {
+        if (typeof candidate.content === 'string' && remainingBudget >= 128) {
+          const compressedCandidate = {
+            ...candidate,
+            content: this.truncateTextToTokenBudget(candidate.content, remainingBudget, `${candidate.role} message`),
+          };
+          const compressedTokens = this.estimateMessageTokens(compressedCandidate);
+
+          if (compressedTokens <= remainingBudget && compressedTokens < candidateTokens) {
+            candidate = compressedCandidate;
+            candidateTokens = compressedTokens;
+            this.outputChannel.appendLine(`Compressed ${candidate.role} message at index ${i}: ${messageTokens[i]} -> ${candidateTokens} tokens`);
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      }
+
+      recentMessages.unshift(candidate);
+      usedTokens += candidateTokens;
     }
 
     // Combine first message with recent messages
     result.push(...recentMessages);
+
+    if (result.length === 0) {
+      const fallback = messages[messages.length - 1];
+      if (typeof fallback?.content === 'string') {
+        const compressedFallback = {
+          ...fallback,
+          content: this.truncateTextToTokenBudget(fallback.content, tokenBudget, `${fallback.role} message`),
+        };
+        result.push(compressedFallback);
+        usedTokens = this.estimateMessageTokens(compressedFallback);
+      } else if (fallback) {
+        result.push(fallback);
+        usedTokens = this.estimateMessageTokens(fallback);
+      }
+    }
 
     this.outputChannel.appendLine(`Truncated: kept ${result.length}/${messages.length} messages, ~${usedTokens} tokens`);
 
@@ -501,7 +596,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         parameters: tool.inputSchema
       }
     }));
-    const toolsOverhead = Math.ceil(JSON.stringify(toolsSchema).length / 4);
+    const toolsOverhead = this.estimateToolsTokens(toolsSchema);
 
     // Step 3: Estimate tool result overhead from history
     const toolResultOverhead = this.estimateToolResultOverhead(messages);
@@ -754,6 +849,102 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return result;
   }
 
+  private hasMessageRole(messages: readonly Record<string, unknown>[], role: string): boolean {
+    return messages.some((message) => typeof message.role === 'string' && message.role === role);
+  }
+
+  private findLastUserMessage(messages: readonly Record<string, unknown>[]): Record<string, unknown> | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role === 'user' && typeof message.content === 'string' && message.content.trim() !== '') {
+        return { ...message };
+      }
+    }
+
+    return undefined;
+  }
+
+  private createSyntheticUserMessage(messages: readonly Record<string, unknown>[]): Record<string, unknown> {
+    const hasToolContext = messages.some(
+      (message) => message.role === 'tool' || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
+    );
+
+    return {
+      role: 'user',
+      content: hasToolContext
+        ? 'Continue the current conversation using the assistant and tool results provided.'
+        : 'Continue the current conversation using the provided context.',
+    };
+  }
+
+  private ensureConversationHasUserTurn(
+    messages: Record<string, unknown>[],
+    sourceMessages: readonly Record<string, unknown>[],
+    tokenBudget?: number
+  ): Record<string, unknown>[] {
+    if (this.hasMessageRole(messages, 'user')) {
+      return messages;
+    }
+
+    const restoredUserMessage = this.findLastUserMessage(sourceMessages);
+    const requiredUserMessage = restoredUserMessage
+      ?? this.createSyntheticUserMessage(sourceMessages.length > 0 ? sourceMessages : messages);
+    const repairedMessages = [...messages];
+    const insertIndex = repairedMessages[0]?.role === 'system' ? 1 : 0;
+    let insertedMessage = { ...requiredUserMessage };
+    let compressedInsertedMessage = false;
+
+    if (typeof tokenBudget === 'number' && tokenBudget > 0 && typeof insertedMessage.content === 'string') {
+      const reservedBudget = Math.max(64, Math.floor(tokenBudget * 0.15));
+      if (this.estimateMessageTokens(insertedMessage) > reservedBudget) {
+        insertedMessage = {
+          ...insertedMessage,
+          content: this.truncateTextToTokenBudget(insertedMessage.content, reservedBudget, 'user message'),
+        };
+        compressedInsertedMessage = true;
+      }
+    }
+
+    repairedMessages.splice(insertIndex, 0, insertedMessage);
+
+    if (typeof tokenBudget === 'number' && tokenBudget > 0) {
+      while (this.estimatePromptTokens(repairedMessages) > tokenBudget && repairedMessages.length > insertIndex + 1) {
+        const removableIndex = repairedMessages.findIndex(
+          (message, index) => index > insertIndex && message.role !== 'user' && message.role !== 'system'
+        );
+
+        if (removableIndex === -1) {
+          break;
+        }
+
+        const removedRole = repairedMessages[removableIndex].role;
+        repairedMessages.splice(removableIndex, 1);
+        this.outputChannel.appendLine(`Removed ${removedRole} message to preserve a required user turn within budget`);
+      }
+    }
+
+    const insertionMode = compressedInsertedMessage ? 'restored/compressed' : 'restored';
+    if (restoredUserMessage) {
+      this.outputChannel.appendLine(`Recovered missing user turn in outbound request (${insertionMode})`);
+    } else {
+      this.outputChannel.appendLine(`Inserted synthetic user turn for tool-only/model-only conversation`);
+    }
+
+    return repairedMessages;
+  }
+
+  private buildInputText(messages: readonly Record<string, unknown>[]): string {
+    return messages
+      .map((message) => {
+        let text = typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '');
+        if (message.tool_calls) {
+          text += JSON.stringify(message.tool_calls);
+        }
+        return text;
+      })
+      .join('\n');
+  }
+
   /**
    * Calculate safe max output tokens based on input estimate
    */
@@ -926,7 +1117,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     this.showWelcomeNotification(model.id);
 
     // Convert messages
-    const openAIMessages: Record<string, unknown>[] = [];
+    let openAIMessages: Record<string, unknown>[] = [];
     if (this.config.systemPrompt) {
       openAIMessages.push({ role: 'system', content: this.config.systemPrompt });
       this.outputChannel.appendLine(`Prepended system prompt (${this.config.systemPrompt.length} chars)`);
@@ -934,6 +1125,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     for (const msg of messages) {
       openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
     }
+    openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
     this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
 
     // Log message structure
@@ -974,21 +1166,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
     }
 
+    messagesToSend = this.ensureConversationHasUserTurn(messagesToSend, openAIMessages, overflowPrediction.contextLimit);
+
     const truncatedMessages = messagesToSend;
     if (truncatedMessages.length < openAIMessages.length) {
       this.outputChannel.appendLine(`WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
     }
 
     // Build input text for token estimation
-    const inputText = truncatedMessages
-      .map((m) => {
-        let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-        if (m.tool_calls) { text += JSON.stringify(m.tool_calls); }
-        return text;
-      })
-      .join('\n');
+    const inputText = this.buildInputText(truncatedMessages);
 
-    const toolsOverhead = options.tools ? Math.ceil(JSON.stringify(options.tools).length / 4) : 0;
+    const toolsOverhead = this.estimateToolsTokens(options.tools as readonly any[] | undefined);
     const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
     const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(model.id, estimatedInputTokens, toolsOverhead);
     const modelMaxContext = overflowPrediction.contextLimit;
@@ -1068,7 +1256,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       let totalContent = '';
       let totalToolCalls = 0;
       let reasoningContent = '';
-      let reasoningEmitted = false;
+      let reasoningHandled = false;
       const idleTimeout = this.config.streamingIdleTimeout;
       const iterator = this.client.streamChatCompletion(
         requestOptions as unknown as OpenAIChatCompletionRequest,
@@ -1108,16 +1296,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           reasoningContent += chunk.reasoning_content;
         }
 
-        if (!reasoningEmitted && reasoningContent && (chunk.content || chunk.finished_tool_calls?.length)) {
-          reasoningEmitted = true;
-          const reasoningBlock = `<details>\n<summary>Thinking...</summary>\n\n${reasoningContent}\n</details>\n\n`;
-          progress.report(new vscode.LanguageModelTextPart(reasoningBlock));
-          this.outputChannel.appendLine(`Emitted reasoning content (${reasoningContent.length} chars)`);
+        if (!reasoningHandled && reasoningContent && (chunk.content || chunk.finished_tool_calls?.length)) {
+          const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
+          reasoningHandled = true;
+          if (normalizedReasoning) {
+            this.outputChannel.appendLine(`Suppressed reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+          }
         }
 
         if (chunk.content) {
-          totalContent += chunk.content;
-          progress.report(new vscode.LanguageModelTextPart(chunk.content));
+          const visibleContent = this.sanitizeVisibleContent(chunk.content);
+          if (visibleContent) {
+            totalContent += visibleContent;
+            progress.report(new vscode.LanguageModelTextPart(visibleContent));
+          }
         }
 
         if (chunk.finished_tool_calls?.length) {
@@ -1128,11 +1320,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       }
 
-      if (!reasoningEmitted && reasoningContent) {
-        reasoningEmitted = true;
-        const reasoningBlock = `<details>\n<summary>Thinking...</summary>\n\n${reasoningContent}\n</details>\n\n`;
-        progress.report(new vscode.LanguageModelTextPart(reasoningBlock));
-        this.outputChannel.appendLine(`Emitted final reasoning content (${reasoningContent.length} chars)`);
+      if (!reasoningHandled && reasoningContent) {
+        const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
+        reasoningHandled = true;
+        if (normalizedReasoning) {
+          this.outputChannel.appendLine(`Suppressed final reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+        }
       }
 
       this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalToolCalls} tool calls`);
@@ -1141,10 +1334,43 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         await this.handleEmptyResponse(model, inputText, openAIMessages.length, requestOptions.tools ? (requestOptions.tools as unknown[]).length : 0, token, progress);
       }
     } catch (error: any) {
+      const missingUserQuery = typeof error?.message === 'string' && error.message.includes('No user query found in messages');
+      if (missingUserQuery && retryAttempt < 1) {
+        const currentMessages = Array.isArray(requestOptions.messages) ? requestOptions.messages as Record<string, unknown>[] : [];
+        const contextBudget = this.modelMetadata.get(model.id)?.maxTokens || this.config.defaultMaxTokens;
+        const repairedMessages = this.ensureConversationHasUserTurn(currentMessages, openAIMessages, contextBudget);
+
+        if (JSON.stringify(repairedMessages) !== JSON.stringify(currentMessages)) {
+          this.outputChannel.appendLine('Server rejected request without a user turn. Retrying once with repaired conversation history.');
+
+          const retryTools = Array.isArray(requestOptions.tools) ? requestOptions.tools as Record<string, unknown>[] : undefined;
+          const repairedInputText = this.buildInputText(repairedMessages);
+          const repairedEstimate = await this.provideTokenCount(model, repairedInputText, token);
+          const repairedMaxOutput = this.calculateSafeMaxOutputTokens(model.id, repairedEstimate, this.estimateToolsTokens(retryTools));
+
+          return this.executeStreamWithRetry(
+            {
+              ...requestOptions,
+              messages: repairedMessages,
+              max_tokens: repairedMaxOutput,
+            },
+            model,
+            openAIMessages,
+            options,
+            token,
+            progress,
+            repairedInputText,
+            retryAttempt + 1
+          );
+        }
+      }
+
       if (error.isContextOverflow && retryAttempt < maxContextRetries) {
-        const serverPromptTokens = error.promptTokens;
-        const serverContextSize = error.contextSize;
-        this.outputChannel.appendLine(`Context overflow from server: ${serverPromptTokens} prompt tokens > ${serverContextSize} context. Retry ${retryAttempt + 1}/${maxContextRetries}`);
+        const serverPromptTokens = typeof error.promptTokens === 'number' ? error.promptTokens : undefined;
+        const serverContextSize = typeof error.contextSize === 'number'
+          ? error.contextSize
+          : (this.modelMetadata.get(model.id)?.maxTokens || this.config.defaultMaxTokens);
+        this.outputChannel.appendLine(`Context overflow from server: ${serverPromptTokens ?? 'unknown'} prompt tokens > ${serverContextSize} context. Retry ${retryAttempt + 1}/${maxContextRetries}`);
 
         if (serverContextSize && serverContextSize > 0) {
           this.modelMetadata.set(model.id, {
@@ -1153,28 +1379,68 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           });
         }
 
-        const currentMessages = requestOptions.messages as any[];
-        const targetTokens = (serverContextSize || this.config.defaultMaxTokens) * 0.7;
-        const aggressivelyTruncated = this.truncateMessagesToFit(currentMessages, targetTokens);
+        const currentMessages = Array.isArray(requestOptions.messages) ? requestOptions.messages as any[] : [];
+        const reserveTokens = Math.max(256, Math.ceil(serverContextSize * 0.05));
+        let retryTools = Array.isArray(requestOptions.tools) ? requestOptions.tools as Record<string, unknown>[] : undefined;
+        let toolTokens = this.estimateToolsTokens(retryTools);
+        const targetPromptTokens = Math.max(512, serverContextSize - reserveTokens);
+        let messageBudget = Math.max(256, targetPromptTokens - toolTokens);
+        let aggressivelyTruncated = this.ensureConversationHasUserTurn(
+          this.truncateMessagesToFit(currentMessages, messageBudget),
+          openAIMessages,
+          messageBudget
+        );
+        let retryPromptEstimate = this.estimatePromptTokens(aggressivelyTruncated, retryTools);
 
-        this.outputChannel.appendLine(`Aggressive truncation: ${currentMessages.length} -> ${aggressivelyTruncated.length} messages, target ${targetTokens} tokens`);
+        this.outputChannel.appendLine(
+          `Retry budgeting: prompt_target=${targetPromptTokens}, message_budget=${messageBudget}, tool_tokens=${toolTokens}, estimate=${retryPromptEstimate}`
+        );
 
-        const newInputText = aggressivelyTruncated
-          .map((m: any) => {
-            let text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '');
-            if (m.tool_calls) { text += JSON.stringify(m.tool_calls); }
-            return text;
-          })
-          .join('\n');
-        const toolsOverhead = requestOptions.tools ? Math.ceil(JSON.stringify(requestOptions.tools).length / 3.3) : 0;
+        if (retryPromptEstimate > targetPromptTokens && retryTools && options.toolMode !== vscode.LanguageModelChatToolMode.Required) {
+          this.outputChannel.appendLine(`Retry still too large. Disabling tools to recover ~${toolTokens} prompt tokens.`);
+          retryTools = undefined;
+          toolTokens = 0;
+          messageBudget = targetPromptTokens;
+          aggressivelyTruncated = this.ensureConversationHasUserTurn(
+            this.truncateMessagesToFit(currentMessages, messageBudget),
+            openAIMessages,
+            messageBudget
+          );
+          retryPromptEstimate = this.estimatePromptTokens(aggressivelyTruncated, retryTools);
+        }
+
+        if (retryPromptEstimate > targetPromptTokens) {
+          const tighterBudget = Math.max(128, messageBudget - Math.max(256, retryPromptEstimate - targetPromptTokens));
+          this.outputChannel.appendLine(`Applying tighter retry truncation: ${messageBudget} -> ${tighterBudget} message tokens`);
+          aggressivelyTruncated = this.ensureConversationHasUserTurn(
+            this.truncateMessagesToFit(aggressivelyTruncated, tighterBudget),
+            openAIMessages,
+            tighterBudget
+          );
+          retryPromptEstimate = this.estimatePromptTokens(aggressivelyTruncated, retryTools);
+        }
+
+        this.outputChannel.appendLine(
+          `Aggressive truncation: ${currentMessages.length} -> ${aggressivelyTruncated.length} messages, estimated prompt ${retryPromptEstimate}/${targetPromptTokens}`
+        );
+
+        const newInputText = this.buildInputText(aggressivelyTruncated);
         const newEstimate = await this.provideTokenCount(model, newInputText, token);
-        const newMaxOutput = this.calculateSafeMaxOutputTokens(model.id, newEstimate, toolsOverhead);
+        const newMaxOutput = this.calculateSafeMaxOutputTokens(model.id, newEstimate, toolTokens);
 
-        const retryOptions = {
+        const retryOptions: Record<string, unknown> = {
           ...requestOptions,
           messages: aggressivelyTruncated,
           max_tokens: newMaxOutput,
         };
+
+        if (retryTools) {
+          retryOptions.tools = retryTools;
+        } else {
+          delete retryOptions.tools;
+          delete retryOptions.tool_choice;
+          delete retryOptions.parallel_tool_calls;
+        }
 
         return this.executeStreamWithRetry(retryOptions, model, openAIMessages, options, token, progress, newInputText, retryAttempt + 1);
       }
