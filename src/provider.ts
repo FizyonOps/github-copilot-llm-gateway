@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { GatewayClient } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest } from './types';
+import { collectWorkspaceInstructionFiles } from './instructions';
 
 const DEFAULT_PROMPT_STRIP_PATTERNS = [
   '(?:You are (?:an expert )?AI programming assistant,\\s*)?working with a user in the VS Code editor\\.',
@@ -426,6 +427,58 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     return sanitizedMessages;
+  }
+
+  private async buildWorkspaceInstructionsPrompt(
+    conversationMessages: readonly Record<string, unknown>[]
+  ): Promise<string | undefined> {
+    const instructionFiles = await collectWorkspaceInstructionFiles();
+    if (instructionFiles.length === 0) {
+      return undefined;
+    }
+
+    const existingContent = conversationMessages
+      .map((message) => typeof message.content === 'string' ? message.content : '')
+      .filter((content) => content !== '')
+      .join('\n\n');
+
+    const sections: string[] = [];
+    for (const file of instructionFiles) {
+      if (existingContent.includes(file.content)) {
+        this.outputChannel.appendLine(`Skipping workspace instructions from ${file.label}; already present in chat context`);
+        continue;
+      }
+
+      this.outputChannel.appendLine(`Loaded workspace instructions from ${file.label} (${file.content.length} chars)`);
+      sections.push(`[Workspace instructions source: ${file.label}]\n${file.content}`);
+    }
+
+    if (sections.length === 0) {
+      return undefined;
+    }
+
+    return sections.join('\n\n---\n\n');
+  }
+
+  private async buildCombinedSystemPrompt(
+    conversationMessages: readonly Record<string, unknown>[]
+  ): Promise<string | undefined> {
+    const sections: string[] = [];
+    const configuredSystemPrompt = this.config.systemPrompt.trim();
+    if (configuredSystemPrompt) {
+      sections.push(configuredSystemPrompt);
+    }
+
+    const workspaceInstructionsPrompt = await this.buildWorkspaceInstructionsPrompt(conversationMessages);
+    if (workspaceInstructionsPrompt) {
+      sections.push(workspaceInstructionsPrompt);
+    }
+
+    if (sections.length === 0) {
+      return undefined;
+    }
+
+    return sections.join('\n\n');
   }
 
   /**
@@ -1213,14 +1266,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Convert messages
     let openAIMessages: Record<string, unknown>[] = [];
-    if (this.config.systemPrompt) {
-      openAIMessages.push({ role: 'system', content: this.config.systemPrompt });
-      this.outputChannel.appendLine(`Prepended system prompt (${this.config.systemPrompt.length} chars)`);
-    }
     for (const msg of messages) {
       openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
     }
     openAIMessages = this.sanitizePromptMessages(openAIMessages);
+
+    const combinedSystemPrompt = await this.buildCombinedSystemPrompt(openAIMessages);
+    if (combinedSystemPrompt) {
+      openAIMessages.unshift({ role: 'system', content: combinedSystemPrompt });
+      this.outputChannel.appendLine(`Prepended combined system prompt (${combinedSystemPrompt.length} chars)`);
+    }
+
     openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
     this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
 

@@ -148,6 +148,18 @@ These settings control how the extension handles agentic features like code edit
 | **System Prompt**             | _(empty)_                | System prompt prepended to every conversation                                              |
 | **Prompt Strip Patterns**     | Built-in safe patterns   | Regex patterns stripped from non-tool prompt text before requests are sent to the model    |
 
+### Workspace Custom Instructions
+
+LLM Gateway automatically includes standard workspace instruction files in chat requests, so repository guidance reaches your self-hosted model instead of only the built-in Copilot models.
+
+- `.github/copilot-instructions.md`
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.claude/CLAUDE.md`
+- `CLAUDE.local.md`
+
+If multiple instruction files are present, the gateway appends them to the first system message in a stable order and logs the loaded sources in the **GitHub Copilot LLM Gateway** output channel.
+
 ## Recommended Models
 
 These models have been tested with good tool calling support:
@@ -248,6 +260,12 @@ The model failed to generate output. Try:
 The model outputs text like "Using the read_file tool..." instead of actually calling tools.
 
 1. Use **Qwen3-8B** or **Qwen2.5-7B-Instruct** (avoid Coder variants)
+
+### Workspace instructions not taking effect
+
+1. Verify that your instruction file is in a supported workspace location such as `.github/copilot-instructions.md` or `AGENTS.md`
+2. Open the **GitHub Copilot LLM Gateway** output channel and confirm the file was loaded for the request
+3. If you use `AGENTS.md` or `CLAUDE.md`, ensure the corresponding VS Code setting is enabled: `chat.useAgentsMdFile` or `chat.useClaudeMdFile`
 2. Set **Agent Temperature** to `0.0`
 3. Disable **Parallel Tool Calling**
 4. Ensure server has `--enable-auto-tool-choice` flag
