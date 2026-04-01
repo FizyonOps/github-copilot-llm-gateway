@@ -2,6 +2,16 @@ import * as vscode from 'vscode';
 import { GatewayClient } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest } from './types';
 
+const DEFAULT_PROMPT_STRIP_PATTERNS = [
+  '(?:You are (?:an expert )?AI programming assistant,\\s*)?working with a user in the VS Code editor\\.',
+  'When asked for your name, you must respond with (?:\\\\?")?GitHub Copilot(?:\\\\?")?\\.',
+  'When asked about the model you are using, you must state that you are using [\\s\\S]*?(?:\\\\n|\\r?\\n|$)',
+  "Follow the user's requirements carefully\\s*&\\s*to the letter\\.",
+  'Follow Microsoft content policies\\.',
+  'Avoid content that violates copyrights\\.',
+  `If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, or violent, only respond with (?:\\\\?")?Sorry, I can't assist with that(?:\\\\?")?\\.?`,
+];
+
 /**
  * Language model provider for OpenAI-compatible inference servers
  */
@@ -347,6 +357,75 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       .replaceAll(/<\/?details>/gi, '')
       .replaceAll(/<\/?summary>/gi, '')
       .trim();
+  }
+
+  private stripPromptPatterns(text: string, label: string): string {
+    if (!text || this.config.promptStripPatterns.length === 0) {
+      return text;
+    }
+
+    let sanitizedText = text;
+    let removedMatches = 0;
+
+    for (const pattern of this.config.promptStripPatterns) {
+      try {
+        const regex = new RegExp(pattern, 'giu');
+        sanitizedText = sanitizedText.replace(regex, () => {
+          removedMatches += 1;
+          return '';
+        });
+      } catch (error) {
+        this.outputChannel.appendLine(`WARNING: Invalid promptStripPatterns regex "${pattern}": ${error}`);
+      }
+    }
+
+    if (removedMatches === 0) {
+      return text;
+    }
+
+    sanitizedText = sanitizedText
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/(?:\\n\s*){3,}/g, '\\n\\n')
+      .trim();
+
+    this.outputChannel.appendLine(`Stripped ${removedMatches} prompt boilerplate match(es) from ${label}`);
+
+    return sanitizedText;
+  }
+
+  private sanitizePromptMessages(messages: Record<string, unknown>[]): Record<string, unknown>[] {
+    const sanitizedMessages: Record<string, unknown>[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.role === 'tool' || typeof message.content !== 'string') {
+        sanitizedMessages.push(message);
+        continue;
+      }
+
+      const role = typeof message.role === 'string' ? message.role : 'unknown';
+      const sanitizedContent = this.stripPromptPatterns(message.content, `message ${i + 1} (${role})`);
+
+      if (sanitizedContent === message.content) {
+        sanitizedMessages.push(message);
+        continue;
+      }
+
+      if (sanitizedContent === '') {
+        if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+          sanitizedMessages.push({ ...message, content: null });
+        } else {
+          this.outputChannel.appendLine(`Dropped empty ${role} message ${i + 1} after prompt pattern stripping`);
+        }
+        continue;
+      }
+
+      sanitizedMessages.push({ ...message, content: sanitizedContent });
+    }
+
+    return sanitizedMessages;
   }
 
   /**
@@ -1141,6 +1220,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     for (const msg of messages) {
       openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
     }
+    openAIMessages = this.sanitizePromptMessages(openAIMessages);
     openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
     this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
 
@@ -1525,6 +1605,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       maxRetries: config.get<number>('maxRetries', 2),
       retryDelay: config.get<number>('retryDelay', 1000),
       systemPrompt: config.get<string>('systemPrompt', ''),
+      promptStripPatterns: config.get<string[]>('promptStripPatterns', DEFAULT_PROMPT_STRIP_PATTERNS),
       contextWarningThreshold: config.get<number>('contextWarningThreshold', 75),
       contextHardLimit: config.get<number>('contextHardLimit', 85),
       maxMessageHistory: config.get<number>('maxMessageHistory', 50),

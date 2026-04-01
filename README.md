@@ -141,6 +141,13 @@ These settings control how the extension handles agentic features like code edit
 
 > **Tip**: If your model outputs tool descriptions as text instead of actually calling tools, try setting **Agent Temperature** to `0.0` and disabling **Parallel Tool Calling**.
 
+### Prompt Settings
+
+| Setting                       | Default                  | Description                                                                                |
+| ----------------------------- | ------------------------ | ------------------------------------------------------------------------------------------ |
+| **System Prompt**             | _(empty)_                | System prompt prepended to every conversation                                              |
+| **Prompt Strip Patterns**     | Built-in safe patterns   | Regex patterns stripped from non-tool prompt text before requests are sent to the model    |
+
 ## Recommended Models
 
 These models have been tested with good tool calling support:
