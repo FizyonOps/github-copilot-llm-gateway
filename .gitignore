@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # Claude AI local settings
 .claude
+
+# Local Copilot instructions
+.github/copilot-instructions.md
