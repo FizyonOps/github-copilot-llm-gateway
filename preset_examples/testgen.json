@@ -1,0 +1,22 @@
+{
+  "name": "Test Gen",
+  "description": "Unit/integration tests. Slightly creative for edge cases, but structured output. DRY penalty avoids copy-paste test bodies",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.35,
+    "top_p": 0.92,
+    "top_k": 30,
+    "min_p": 0.04,
+    "frequency_penalty": 0.05,
+    "repeat_penalty": 1.05,
+    "repeat_last_n": 128,
+    "dry_multiplier": 0.5,
+    "dry_base": 1.75,
+    "dry_allowed_length": 4
+  }
+}

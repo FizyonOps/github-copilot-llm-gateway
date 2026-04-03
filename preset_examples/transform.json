@@ -1,0 +1,17 @@
+{
+  "name": "Transform",
+  "description": "JSON/YAML manipulation, regex, data conversion. Deterministic with seed for reproducibility across runs",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.05,
+    "top_p": 0.95,
+    "top_k": 10,
+    "min_p": 0.08,
+    "seed": 42
+  }
+}

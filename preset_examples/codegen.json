@@ -1,0 +1,19 @@
+{
+  "name": "Code Gen",
+  "description": "Writing new functions, components, endpoints. Precise but not robotic — allows minor variance for natural code style",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "top_k": 20,
+    "min_p": 0.05,
+    "frequency_penalty": 0,
+    "presence_penalty": 0,
+    "dry_multiplier": 0
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Debug",
+  "description": "Stack trace analysis, root cause finding. Mirostat sampling for consistent perplexity — methodical step-by-step reasoning without wandering",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.25,
+    "top_p": 0.9,
+    "top_k": 30,
+    "min_p": 0.04,
+    "repeat_penalty": 1.08,
+    "repeat_last_n": 128,
+    "mirostat": 2,
+    "mirostat_tau": 4,
+    "mirostat_eta": 0.1
+  }
+}

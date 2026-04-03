@@ -1,0 +1,17 @@
+{
+  "name": "Refactor",
+  "description": "Deterministic transforms — rename, extract, restructure. Reproducible output, zero creativity",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+    "min_p": 0,
+    "seed": 42
+  }
+}

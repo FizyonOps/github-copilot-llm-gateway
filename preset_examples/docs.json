@@ -1,0 +1,22 @@
+{
+  "name": "Docs",
+  "description": "JSDoc, README, API docs, comments. Natural prose with DRY penalty against boilerplate repetition across docstrings",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.5,
+    "top_p": 0.93,
+    "top_k": 50,
+    "min_p": 0.02,
+    "presence_penalty": 0.2,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 256,
+    "dry_multiplier": 0.8,
+    "dry_base": 1.75,
+    "dry_allowed_length": 3
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "CLI",
+  "description": "Shell commands, one-liners, scripts. Maximum precision — a wrong flag can be destructive. No creativity, no variance",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+    "min_p": 0,
+    "frequency_penalty": 0,
+    "presence_penalty": 0
+  }
+}

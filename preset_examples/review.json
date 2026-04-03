@@ -1,0 +1,20 @@
+{
+  "name": "Review",
+  "description": "Code review, bug hunting, security audit. Thorough coverage — presence penalty forces exploring different angles instead of repeating the same finding",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.3,
+    "top_p": 0.92,
+    "top_k": 40,
+    "min_p": 0.03,
+    "presence_penalty": 0.3,
+    "frequency_penalty": 0.1,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 256
+  }
+}

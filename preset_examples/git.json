@@ -1,0 +1,22 @@
+{
+  "name": "Git",
+  "description": "Commit messages, PR descriptions, changelogs. Concise, consistent formatting. DRY prevents \"Updated X. Updated Y. Updated Z.\" patterns",
+  "backends": [
+    "llamacpp",
+    "vllm",
+    "openai",
+    "unknown"
+  ],
+  "params": {
+    "temperature": 0.3,
+    "top_p": 0.9,
+    "top_k": 30,
+    "min_p": 0.04,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 256,
+    "dry_multiplier": 1,
+    "dry_base": 1.75,
+    "dry_allowed_length": 2,
+    "dry_penalty_last_n": 256
+  }
+}
