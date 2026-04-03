@@ -100,8 +100,25 @@ export interface GatewayConfig {
   retryDelay: number;
   systemPrompt: string;
   promptStripPatterns: string[];
-  contextWarningThreshold: number; // Warn when input tokens exceed this % of limit (default 80)
-  contextHardLimit: number; // Hard cutoff % of context limit (default 95)
-  maxMessageHistory: number; // Maximum messages to keep (default 50)
-  enableProactiveTruncation: boolean; // Truncate before sending if near limit
+  contextWarningThreshold: number;
+  contextHardLimit: number;
+  maxMessageHistory: number;
+  enableProactiveTruncation: boolean;
+  activePreset: string;
+  showThinking: boolean;
+  /** reasoning_budget override: null = use preset/server default, 0 = off, -1 = unlimited, >0 = token limit */
+  reasoningBudget: number | null;
+  /** Reasoning format: 'auto' = detect from template, 'deepseek' = force separate reasoning_content, 'none' = disable */
+  reasoningFormat: 'auto' | 'deepseek' | 'none';
+  /** Context usage % at which automatic LLM-based condensation is triggered (default 80) */
+  contextCondensationThreshold: number;
+}
+
+/** Runtime stats tracked per-request for status bar display */
+export interface RequestStats {
+  lastTokensPerSec: number;
+  lastContextPercent: number;
+  lastInputTokens: number;
+  lastOutputChars: number;
+  requestCount: number;
 }

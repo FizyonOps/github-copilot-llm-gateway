@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { GatewayClient } from './client';
-import { GatewayConfig, OpenAIChatCompletionRequest } from './types';
+import { GatewayConfig, OpenAIChatCompletionRequest, RequestStats } from './types';
 import { collectWorkspaceInstructionFiles } from './instructions';
+import { BackendType, BUILTIN_PRESETS, SamplingPreset, detectBackend, filterParamsForBackend, getAllowedKeysForBackend, resolvePresetsDir, ensurePresetsDir, loadPresetsFromDir, getPresetFilePath, detectTemplateFromJinja, TemplateCaps } from './presets';
 
 const DEFAULT_PROMPT_STRIP_PATTERNS = [
   '(?:You are (?:an expert )?AI programming assistant,\\s*)?working with a user in the VS Code editor\\.',
@@ -14,6 +15,18 @@ const DEFAULT_PROMPT_STRIP_PATTERNS = [
 ];
 
 /**
+ * Model variant suffix encoding: "<base-id>__rb:<budget>"
+ * budget: 0 = off, -1 = unlimited, >0 = token cap
+ */
+const MODEL_VARIANT_RE = /__rb:(-?\d+)$/;
+
+function parseModelVariant(modelId: string): { realId: string; variantBudget: number | null } {
+  const m = MODEL_VARIANT_RE.exec(modelId);
+  if (!m) return { realId: modelId, variantBudget: null };
+  return { realId: modelId.slice(0, -m[0].length), variantBudget: parseInt(m[1], 10) };
+}
+
+/**
  * Language model provider for OpenAI-compatible inference servers
  */
 export class GatewayProvider implements vscode.LanguageModelChatProvider {
@@ -23,12 +36,24 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   // Store tool schemas for the current request to fill missing required properties
   private readonly currentToolSchemas: Map<string, unknown> = new Map();
   private statusBarItem: vscode.StatusBarItem | undefined;
+  private presetStatusBarItem: vscode.StatusBarItem | undefined;
   private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
+  private detectedBackend: BackendType = 'unknown';
+  private detectedTemplate: TemplateCaps = { template: 'unknown', supportsToolRole: true, supportsSystemRole: true, hasNativeThinking: false };
+  private presetsDir: string = '';
+  private loadedPresets: Record<string, SamplingPreset> = {};
+  private presetWatcher: vscode.FileSystemWatcher | undefined;
+  private requestStats: RequestStats = { lastTokensPerSec: 0, lastContextPercent: 0, lastInputTokens: 0, lastOutputChars: 0, requestCount: 0 };
+  /** Stored conversation for export (model id → messages) */
+  private lastConversation: { modelId: string; messages: Array<{ role: string; content: string; thinking?: string }> } | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext, outputChannel?: vscode.OutputChannel) {
     this.outputChannel = outputChannel ?? vscode.window.createOutputChannel('GitHub Copilot LLM Gateway');
     this.config = this.loadConfig();
     this.client = new GatewayClient(this.config);
+
+    // Initialize file-based presets
+    this.initializePresets();
 
     // Watch for configuration changes
     context.subscriptions.push(
@@ -51,6 +76,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     this.outputChannel.appendLine('Model metadata cache cleared');
     vscode.window.showInformationMessage('GitHub Copilot LLM Gateway: Models refreshed');
   }
+
+  /** Public accessors for chat participant */
+  getStats(): RequestStats { return this.requestStats; }
+  getBackend(): BackendType { return this.detectedBackend; }
+  getTemplate(): TemplateCaps { return this.detectedTemplate; }
+  getConfig(): GatewayConfig { return this.config; }
+  getPresets(): Record<string, SamplingPreset> { return this.loadedPresets; }
+  getLastConversation() { return this.lastConversation; }
 
   /**
    * Map VS Code message role to OpenAI role string
@@ -881,6 +914,32 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine('Fetching models from inference server...');
       const response = await this.client.fetchModels();
 
+      // Detect backend type from response
+      this.detectedBackend = detectBackend(response as any);
+      this.outputChannel.appendLine(`Detected backend: ${this.detectedBackend}`);
+
+      // For llama.cpp: fetch /props to get the actual Jinja chat template and detect capabilities
+      if (this.detectedBackend === 'llamacpp') {
+        const props = await this.client.fetchProps();
+        if (props?.chat_template) {
+          this.detectedTemplate = detectTemplateFromJinja(props.chat_template);
+          // Override hasNativeThinking from the server's own detection
+          if (props.chat_template_explicit_reasoning === true) {
+            this.detectedTemplate.hasNativeThinking = true;
+          }
+          this.outputChannel.appendLine(
+            `Chat template: ${this.detectedTemplate.template} (toolRole=${this.detectedTemplate.supportsToolRole}, systemRole=${this.detectedTemplate.supportsSystemRole}, nativeThinking=${this.detectedTemplate.hasNativeThinking})`
+          );
+        } else {
+          this.outputChannel.appendLine('Could not fetch /props — template capabilities unknown, assuming full support');
+        }
+      } else {
+        // Non-llamacpp: assume full support
+        this.detectedTemplate = { template: 'unknown', supportsToolRole: true, supportsSystemRole: true, hasNativeThinking: false };
+      }
+
+      this.updatePresetStatusBar();
+
       const models: vscode.LanguageModelChatInformation[] = [];
 
       for (const model of response.data) {
@@ -916,6 +975,29 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         };
 
         models.push(modelInfo);
+
+        // Register reasoning-budget variants so users can select the thinking
+        // level directly from the model picker (works on any backend).
+        const THINKING_VARIANTS: Array<{ suffix: string; label: string }> = [
+          { suffix: '__rb:0', label: '[think: off]' },
+          { suffix: '__rb:1024', label: '[think: 1k]' },
+          { suffix: '__rb:4096', label: '[think: 4k]' },
+          { suffix: '__rb:16384', label: '[think: 16k]' },
+          { suffix: '__rb:-1', label: '[think: ∞]' },
+        ];
+        for (const v of THINKING_VARIANTS) {
+          const variantId = model.id + v.suffix;
+          this.modelMetadata.set(variantId, { maxTokens, maxOutputTokens });
+          models.push({
+            id: variantId,
+            name: `${model.id} ${v.label}`,
+            family: 'llm-gateway',
+            maxInputTokens: maxTokens,
+            maxOutputTokens: maxOutputTokens,
+            version: '1.0.0',
+            capabilities: { toolCalling: this.config.enableToolCalling },
+          });
+        }
       }
 
       this.outputChannel.appendLine(`Found ${models.length} models: ${models.map(m => m.id).join(', ')}`);
@@ -1249,6 +1331,212 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
+   * Adapt outbound messages to match the detected chat template's capabilities.
+   *
+   * - Templates that don't support 'tool' role: merge tool results into the next user message
+   *   as a bracketed block, and strip tool_calls from assistant messages.
+   * - Templates that don't support 'system' role (e.g. Gemma): prepend the system content
+   *   to the first user message.
+   *
+   * This prevents silent prompt corruption when llama.cpp applies the chat template
+   * and encounters roles it doesn't know how to format.
+   */
+  private adaptMessagesForTemplate(messages: Record<string, unknown>[]): Record<string, unknown>[] {
+    const caps = this.detectedTemplate;
+
+    // Fast-path: nothing to adapt
+    if (caps.supportsToolRole && caps.supportsSystemRole) {
+      return messages;
+    }
+
+    const adapted: Record<string, unknown>[] = [];
+    let pendingSystemContent = '';
+    let pendingToolContent = '';
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const role = typeof msg.role === 'string' ? msg.role : '';
+
+      // ── System role ───────────────────────────────────────────────
+      if (role === 'system' && !caps.supportsSystemRole) {
+        const content = typeof msg.content === 'string' ? msg.content : '';
+        pendingSystemContent += (pendingSystemContent ? '\n\n' : '') + content;
+        this.outputChannel.appendLine(`Template adaptation: system message merged into next user message (${content.length} chars)`);
+        continue;
+      }
+
+      // ── Tool role ─────────────────────────────────────────────────
+      if (role === 'tool' && !caps.supportsToolRole) {
+        const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
+        const callId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : '';
+        pendingToolContent += `\n[Tool result${callId ? ` (${callId})` : ''}]:\n${content}`;
+        this.outputChannel.appendLine(`Template adaptation: tool result queued for merging into next user message`);
+        continue;
+      }
+
+      // ── User role — flush pending system/tool content ─────────────
+      if (role === 'user') {
+        let userContent = typeof msg.content === 'string' ? msg.content : '';
+        let prefix = '';
+        if (pendingSystemContent) {
+          prefix += `[System context]:\n${pendingSystemContent}\n\n`;
+          pendingSystemContent = '';
+        }
+        if (pendingToolContent) {
+          prefix += pendingToolContent.trimStart() + '\n\n';
+          pendingToolContent = '';
+        }
+        if (prefix) {
+          userContent = prefix + userContent;
+        }
+        adapted.push({ ...msg, content: userContent });
+        continue;
+      }
+
+      // ── Assistant role — strip tool_calls if template can't handle them ──
+      if (role === 'assistant' && !caps.supportsToolRole && Array.isArray(msg.tool_calls)) {
+        const { tool_calls: _tc, ...rest } = msg as any;
+        // Convert tool calls into readable text appended to content
+        const toolCallText = (msg.tool_calls as any[])
+          .map((tc: any) => `[Called: ${tc?.function?.name ?? 'tool'}(${tc?.function?.arguments ?? ''})]`)
+          .join('\n');
+        const content = typeof msg.content === 'string' && msg.content
+          ? `${msg.content}\n${toolCallText}`
+          : toolCallText;
+        adapted.push({ ...rest, content });
+        continue;
+      }
+
+      adapted.push(msg);
+    }
+
+    // Flush any leftover pending content as a synthetic user message
+    if (pendingToolContent) {
+      adapted.push({ role: 'user', content: pendingToolContent.trim() });
+      this.outputChannel.appendLine('Template adaptation: added synthetic user message for trailing tool results');
+    }
+
+    return adapted;
+  }
+
+  /**
+   * Condense older conversation messages using the LLM to produce a compact summary.
+   * Keeps the system prompt (first message) and the last KEEP_RECENT messages intact.
+   * Everything in between is sent to the LLM for summarization.
+   * Returns the original messages unchanged if condensation fails or is unnecessary.
+   */
+  private async condenseMessages(
+    messages: Record<string, unknown>[],
+    modelId: string,
+    token: vscode.CancellationToken
+  ): Promise<Record<string, unknown>[]> {
+    const KEEP_RECENT = 6;
+
+    if (messages.length <= KEEP_RECENT + 2) {
+      return messages;
+    }
+
+    const hasSystem = messages[0]?.role === 'system';
+    const startIdx = hasSystem ? 1 : 0;
+    const recentStart = Math.max(startIdx, messages.length - KEEP_RECENT);
+    const oldMessages = messages.slice(startIdx, recentStart);
+    const recentMessages = messages.slice(recentStart);
+
+    if (oldMessages.length === 0) {
+      return messages;
+    }
+
+    // Build a text representation of older messages for the condensation prompt
+    const conversationParts: string[] = [];
+    for (const msg of oldMessages) {
+      const role = typeof msg.role === 'string' ? msg.role : 'unknown';
+
+      // Skip empty tool results in the condensation input to save tokens
+      if (role === 'tool') {
+        const content = typeof msg.content === 'string' ? msg.content : '';
+        // Include only a short excerpt for tool results
+        const excerpt = content.length > 500 ? content.substring(0, 500) + '...[truncated]' : content;
+        if (excerpt.trim()) {
+          conversationParts.push(`[tool result]: ${excerpt}`);
+        }
+        continue;
+      }
+
+      let content = typeof msg.content === 'string' ? msg.content : (msg.content ? JSON.stringify(msg.content) : '');
+      if (content.length > 2000) {
+        content = content.substring(0, 2000) + '...[truncated]';
+      }
+      if (content.trim()) {
+        conversationParts.push(`[${role}]: ${content}`);
+      }
+
+      // Note tool calls
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        const names = msg.tool_calls.map((tc: any) => tc?.function?.name || 'unknown').join(', ');
+        conversationParts.push(`[${role} called tools: ${names}]`);
+      }
+    }
+
+    const conversationText = conversationParts.join('\n\n');
+    if (conversationText.trim().length < 100) {
+      // Too little content to bother condensing
+      return messages;
+    }
+
+    const condensationPrompt =
+      `Summarize this conversation concisely, preserving:\n` +
+      `- Key technical decisions and requirements\n` +
+      `- File paths, function/variable names, and code references\n` +
+      `- Current work state (what is done, what is pending)\n` +
+      `- Errors encountered and their resolutions\n` +
+      `- Important constraints or user preferences\n\n` +
+      `Respond with ONLY the summary. No meta-commentary.\n\n---\n\n${conversationText}`;
+
+    this.outputChannel.appendLine(`Condensation: summarizing ${oldMessages.length} older messages (${conversationText.length} chars)...`);
+
+    try {
+      const summary = await this.client.chatComplete(
+        {
+          model: modelId,
+          messages: [
+            { role: 'system', content: 'You are a conversation summarizer. Be concise but preserve all technically important details.' },
+            { role: 'user', content: condensationPrompt },
+          ],
+          max_tokens: 2048,
+          temperature: 0.1,
+        } as any,
+        token
+      );
+
+      if (!summary || summary.trim().length === 0) {
+        this.outputChannel.appendLine('Condensation returned empty result, falling back to truncation');
+        return messages;
+      }
+
+      const condensed: Record<string, unknown>[] = [];
+      if (hasSystem) {
+        condensed.push(messages[0]);
+      }
+      condensed.push({
+        role: 'system',
+        content: `[Condensed conversation context — ${oldMessages.length} messages summarized]\n${summary.trim()}`,
+      });
+      condensed.push(...recentMessages);
+
+      const oldTokens = this.estimatePromptTokens(messages);
+      const newTokens = this.estimatePromptTokens(condensed);
+      this.outputChannel.appendLine(
+        `Condensation complete: ${messages.length} → ${condensed.length} messages, ~${oldTokens} → ~${newTokens} tokens (saved ~${oldTokens - newTokens})`
+      );
+
+      return condensed;
+    } catch (error) {
+      this.outputChannel.appendLine(`Condensation failed: ${error}. Falling back to truncation.`);
+      return messages;
+    }
+  }
+
+  /**
    * Provide language model chat response - streams responses from inference server
    */
   async provideLanguageModelChatResponse(
@@ -1261,6 +1549,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
     this.outputChannel.appendLine(`Tool mode: ${options.toolMode}, Tools: ${options.tools?.length || 0}`);
     this.outputChannel.appendLine(`Message count: ${messages.length}`);
+
+    // Resolve model variant: strip "__rb:<N>" suffix, extract per-variant budget
+    const { realId: actualModelId, variantBudget } = parseModelVariant(model.id);
+    if (variantBudget !== null) {
+      this.outputChannel.appendLine(`Model variant resolved: realId=${actualModelId}, variantBudget=${variantBudget}`);
+    }
 
     this.showWelcomeNotification(model.id);
 
@@ -1275,6 +1569,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (combinedSystemPrompt) {
       openAIMessages.unshift({ role: 'system', content: combinedSystemPrompt });
       this.outputChannel.appendLine(`Prepended combined system prompt (${combinedSystemPrompt.length} chars)`);
+    }
+
+    // Adapt messages to the detected llama.cpp chat template before sending,
+    // so 'tool' / 'system' roles are not silently mangled by an incompatible template.
+    if (this.detectedBackend === 'llamacpp') {
+      openAIMessages = this.adaptMessagesForTemplate(openAIMessages);
     }
 
     openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
@@ -1313,7 +1613,26 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
     // Apply proactive truncation if enabled
     let messagesToSend = openAIMessages;
-    if (overflowPrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
+
+    // Calculate context usage percentage for condensation check
+    const usagePercent = (overflowPrediction.estimatedTotalTokens / overflowPrediction.contextLimit) * 100;
+    const condensationThreshold = this.config.contextCondensationThreshold || 80;
+
+    if (usagePercent >= condensationThreshold && openAIMessages.length > 8) {
+      // Try LLM-based condensation first — preserves context better than mechanical truncation
+      this.outputChannel.appendLine(
+        `Context at ${usagePercent.toFixed(1)}% (threshold: ${condensationThreshold}%). Attempting LLM condensation...`
+      );
+      const { realId: condensationModelId } = parseModelVariant(model.id);
+      messagesToSend = await this.condenseMessages(openAIMessages, condensationModelId, token);
+
+      // Re-check after condensation; if still too large, apply mechanical truncation as fallback
+      const postCondensePrediction = this.predictContextOverflow(messagesToSend, options.tools || [], model.id);
+      if (postCondensePrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
+        this.outputChannel.appendLine(`Post-condensation still at ${((postCondensePrediction.estimatedTotalTokens / postCondensePrediction.contextLimit) * 100).toFixed(1)}%. Applying fallback truncation.`);
+        messagesToSend = this.applySmartTruncation(messagesToSend, postCondensePrediction, model.id);
+      }
+    } else if (overflowPrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
       this.outputChannel.appendLine(`Applying proactive compaction: ${overflowPrediction.recommendedAction}`);
       messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
     }
@@ -1337,21 +1656,105 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
     );
 
-    // Build request with dynamic temperature
+    // Parse inline overrides from the last user message: /temp 0.2, /preset codegen, /grammar {...}
+    const inlineOverrides = this.parseInlineOverrides(truncatedMessages);
+    if (inlineOverrides.preset) {
+      const overridePreset = this.loadedPresets[inlineOverrides.preset];
+      if (overridePreset) {
+        this.outputChannel.appendLine(`Inline override: preset=${inlineOverrides.preset}`);
+      } else {
+        this.outputChannel.appendLine(`WARNING: Inline /preset '${inlineOverrides.preset}' not found, ignoring`);
+        inlineOverrides.preset = undefined;
+      }
+    }
+
+    // Build request with dynamic temperature from preset
     const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
+    // Inline /preset override takes priority over config activePreset
+    const effectivePresetKey = inlineOverrides.preset ?? this.config.activePreset;
+    const activePreset = this.loadedPresets[effectivePresetKey] ?? this.getActivePreset();
+    const presetParams = activePreset
+      ? filterParamsForBackend(activePreset.params, this.detectedBackend)
+      : {};
+
+    // Determine temperature: tool mode uses agentTemperature, otherwise inline → preset → modelOptions → 0.7
     let temperature = 0.7;
     if (hasTools) {
       temperature = this.config.agentTemperature ?? 0;
+    } else if (inlineOverrides.temperature !== undefined) {
+      temperature = inlineOverrides.temperature;
+    } else if (activePreset && activePreset.params.temperature !== undefined) {
+      temperature = activePreset.params.temperature;
     } else if (options.modelOptions && typeof options.modelOptions.temperature === 'number') {
       temperature = options.modelOptions.temperature;
     }
 
     const requestOptions: Record<string, unknown> = {
-      model: model.id,
+      model: actualModelId,  // strip variant suffix before sending to server
       messages: truncatedMessages,
       max_tokens: safeMaxOutputTokens,
       temperature,
     };
+
+    // Apply preset sampling params (backend-filtered)
+    for (const [key, value] of Object.entries(presetParams)) {
+      if (key !== 'temperature' && value !== undefined) {
+        requestOptions[key] = value;
+      }
+    }
+    if (activePreset) {
+      this.outputChannel.appendLine(`Applied preset '${activePreset.name}' (backend: ${this.detectedBackend}): ${JSON.stringify(presetParams)}`);
+    }
+
+    // Resolve reasoning_budget: model variant > global config setting > preset (already applied above)
+    // Priority: variantBudget (from model picker) > config.reasoningBudget > preset's reasoning_budget
+    const effectiveBudget = variantBudget !== null ? variantBudget : this.config.reasoningBudget;
+    if (effectiveBudget !== null && effectiveBudget !== undefined) {
+      requestOptions['reasoning_budget'] = effectiveBudget;
+      this.outputChannel.appendLine(`Reasoning budget: ${effectiveBudget} (source: ${variantBudget !== null ? 'model variant' : 'global config'})`);
+    }
+
+    // llama.cpp reasoning/thinking support:
+    // - reasoning_format: "deepseek" tells the server to stream <think> content as separate
+    //   `reasoning_content` field in SSE delta chunks (instead of mixing into content).
+    // - chat_template_kwargs: {"enable_thinking": true} asks the Jinja template to activate
+    //   thinking mode (for models like Qwen3 that support togglable thinking via template kwarg).
+    // reasoningFormat setting: 'auto' = use template detection, 'deepseek' = force on, 'none' = force off
+    // In 'auto' mode: if a reasoning budget is explicitly set (variant or config), we also enable
+    // reasoning_format because the user clearly wants thinking — even if the template wasn't auto-detected.
+    if (this.detectedBackend === 'llamacpp') {
+      const formatSetting = this.config.reasoningFormat || 'auto';
+      const templateSupports = this.detectedTemplate.hasNativeThinking;
+      const hasBudget = effectiveBudget !== null && effectiveBudget !== undefined;
+      const budgetEnablesThinking = hasBudget && effectiveBudget !== 0;
+      const budgetDisablesThinking = hasBudget && effectiveBudget === 0;
+
+      // Determine whether reasoning_format should be enabled:
+      // 1. Setting = 'deepseek' → always enable
+      // 2. Setting = 'auto' + template supports → enable
+      // 3. Setting = 'auto' + reasoning budget explicitly set (>0 or -1) → enable (user clearly wants thinking)
+      const shouldEnable = formatSetting === 'deepseek'
+        || (formatSetting === 'auto' && templateSupports)
+        || (formatSetting === 'auto' && budgetEnablesThinking);
+
+      if (shouldEnable && !budgetDisablesThinking) {
+        requestOptions['reasoning_format'] = 'deepseek';
+        requestOptions['chat_template_kwargs'] = { enable_thinking: true };
+        const source = formatSetting === 'deepseek' ? 'forced by setting'
+          : templateSupports ? 'auto-detected from template'
+            : 'inferred from reasoning budget';
+        this.outputChannel.appendLine(`Reasoning format: deepseek (${source})`);
+      } else if (budgetDisablesThinking) {
+        // Budget = 0 means user explicitly disabled thinking
+        requestOptions['reasoning_format'] = 'none';
+        requestOptions['chat_template_kwargs'] = { enable_thinking: false };
+        this.outputChannel.appendLine('Reasoning format: none (thinking disabled by budget=0)');
+      } else if (formatSetting === 'none') {
+        requestOptions['reasoning_format'] = 'none';
+        this.outputChannel.appendLine('Reasoning format: none (forced by setting)');
+      }
+      // formatSetting='auto' && !templateSupports && no explicit budget: don't send anything
+    }
 
     const toolsConfig = this.buildToolsConfig(options);
     if (toolsConfig) {
@@ -1363,14 +1766,33 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       this.outputChannel.appendLine(`Sending ${toolsConfig.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
     }
 
+    // Allow modelOptions to override preset params (backend-aware)
     if (options.modelOptions) {
-      const allowedKeys = ['temperature', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'stop', 'seed'];
+      const allowedKeys = getAllowedKeysForBackend(this.detectedBackend);
       for (const key of allowedKeys) {
         if (key in options.modelOptions && (options.modelOptions as Record<string, unknown>)[key] !== undefined) {
           (requestOptions as Record<string, unknown>)[key] = (options.modelOptions as Record<string, unknown>)[key];
         }
       }
     }
+
+    // Apply inline /grammar or /schema override (llama.cpp only)
+    if (inlineOverrides.grammar && this.detectedBackend === 'llamacpp') {
+      requestOptions.grammar = inlineOverrides.grammar;
+      this.outputChannel.appendLine(`Inline override: grammar applied (${inlineOverrides.grammar.length} chars)`);
+    }
+    if (inlineOverrides.jsonSchema) {
+      requestOptions.response_format = { type: 'json_schema', json_schema: { name: 'response', schema: inlineOverrides.jsonSchema } };
+      this.outputChannel.appendLine(`Inline override: JSON schema applied`);
+    }
+
+    // Store conversation snapshot for export
+    this.lastConversation = {
+      modelId: model.id,
+      messages: truncatedMessages
+        .filter((m) => typeof m.role === 'string' && typeof m.content === 'string')
+        .map((m) => ({ role: m.role as string, content: m.content as string })),
+    };
 
     // Log request (sanitized)
     const sanitizedRequest = { ...requestOptions };
@@ -1409,6 +1831,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       let totalToolCalls = 0;
       let reasoningContent = '';
       let reasoningHandled = false;
+      const streamStartMs = Date.now();
+      let totalOutputChars = 0;     // all generated chars (content + reasoning)
+      let totalReasoningChars = 0;  // reasoning-only chars
       const idleTimeout = this.config.streamingIdleTimeout;
       const iterator = this.client.streamChatCompletion(
         requestOptions as unknown as OpenAIChatCompletionRequest,
@@ -1446,13 +1871,23 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
         if (chunk.reasoning_content) {
           reasoningContent += chunk.reasoning_content;
+          totalReasoningChars += chunk.reasoning_content.length;
+          totalOutputChars += chunk.reasoning_content.length;
         }
 
         if (!reasoningHandled && reasoningContent && (chunk.content || chunk.finished_tool_calls?.length)) {
           const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
           reasoningHandled = true;
           if (normalizedReasoning) {
-            this.outputChannel.appendLine(`Suppressed reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+            if (this.config.showThinking) {
+              // Show thinking as blockquote (VS Code chat doesn't render HTML)
+              const thinkingLines = normalizedReasoning.split('\n').map(line => `> ${line}`).join('\n');
+              const thinkingSection = `> **💭 Thinking** *(${normalizedReasoning.length} chars)*\n${thinkingLines}\n\n---\n\n`;
+              progress.report(new vscode.LanguageModelTextPart(thinkingSection));
+              this.outputChannel.appendLine(`Displayed thinking content in chat UI (${normalizedReasoning.length} chars)`);
+            } else {
+              this.outputChannel.appendLine(`Suppressed reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+            }
           }
         }
 
@@ -1460,6 +1895,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           const visibleContent = this.sanitizeVisibleContent(chunk.content);
           if (visibleContent) {
             totalContent += visibleContent;
+            totalOutputChars += visibleContent.length;
             progress.report(new vscode.LanguageModelTextPart(visibleContent));
           }
         }
@@ -1476,11 +1912,48 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
         reasoningHandled = true;
         if (normalizedReasoning) {
-          this.outputChannel.appendLine(`Suppressed final reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+          if (this.config.showThinking) {
+            const thinkingLines = normalizedReasoning.split('\n').map(line => `> ${line}`).join('\n');
+            const thinkingSection = `> **💭 Thinking** *(${normalizedReasoning.length} chars)*\n${thinkingLines}\n\n---\n\n`;
+            progress.report(new vscode.LanguageModelTextPart(thinkingSection));
+            this.outputChannel.appendLine(`Displayed final thinking content in chat UI (${normalizedReasoning.length} chars)`);
+          } else {
+            this.outputChannel.appendLine(`Suppressed final reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+          }
         }
       }
 
-      this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} characters, ${totalToolCalls} tool calls`);
+      // Update request stats for status bar
+      const elapsedSec = Math.max(0.1, (Date.now() - streamStartMs) / 1000);
+      const modelCtx = model.maxInputTokens ?? this.config.defaultMaxTokens;
+      // Use the actual estimated input tokens we computed earlier (estimatedInputTokens from provideTokenCount)
+      const inputTokens = Math.ceil((this.buildInputText(Array.isArray(requestOptions.messages) ? requestOptions.messages as Record<string, unknown>[] : [])).length / 3.3);
+      // Token count: total generated chars / 3.3 (matches our input estimation ratio)
+      const outputTokenCount = Math.ceil(totalOutputChars / 3.3);
+      const tokPerSec = Math.round(outputTokenCount / elapsedSec);
+      const ctxPercent = modelCtx > 0 ? Math.round((inputTokens / modelCtx) * 100) : 0;
+      const reasoningTokens = Math.ceil(totalReasoningChars / 3.3);
+      this.updateRequestStats({
+        lastTokensPerSec: tokPerSec,
+        lastContextPercent: ctxPercent,
+        lastInputTokens: inputTokens,
+        lastOutputChars: totalContent.length,
+        requestCount: this.requestStats.requestCount + 1,
+      });
+
+      // Show inline stats footer in chat (only for text responses, not pure tool calls)
+      if (totalContent.length > 0) {
+        const presetLabel = this.getActivePreset()?.name ?? this.config.activePreset;
+        const thinkingNote = reasoningTokens > 0 ? ` · ${reasoningTokens} think` : '';
+        const statsLine = `\n\n---\n*${tokPerSec} t/s · ${ctxPercent}% ctx${thinkingNote} · ${presetLabel}*`;
+        progress.report(new vscode.LanguageModelTextPart(statsLine));
+      }
+
+      // Append response to conversation snapshot
+      if (this.lastConversation && totalContent) {
+        this.lastConversation.messages.push({ role: 'assistant', content: totalContent, thinking: reasoningContent || undefined });
+      }
+      this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} chars content + ${totalReasoningChars} chars reasoning, ${totalToolCalls} tool calls, ~${outputTokenCount} output tokens (${reasoningTokens} thinking) in ${elapsedSec.toFixed(1)}s (~${tokPerSec} tok/s)`);
 
       if (totalContent.length === 0 && totalToolCalls === 0) {
         await this.handleEmptyResponse(model, inputText, openAIMessages.length, requestOptions.tools ? (requestOptions.tools as unknown[]).length : 0, token, progress);
@@ -1666,6 +2139,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       contextHardLimit: config.get<number>('contextHardLimit', 85),
       maxMessageHistory: config.get<number>('maxMessageHistory', 50),
       enableProactiveTruncation: config.get<boolean>('enableProactiveTruncation', true),
+      activePreset: config.get<string>('activePreset', 'codegen'),
+      showThinking: config.get<boolean>('showThinking', false),
+      reasoningBudget: config.get<number | null>('reasoningBudget', null),
+      reasoningFormat: config.get<'auto' | 'deepseek' | 'none'>('reasoningFormat', 'auto'),
+      contextCondensationThreshold: config.get<number>('contextCondensationThreshold', 80),
     };
 
     // Validate requestTimeout
@@ -1696,14 +2174,438 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return cfg;
   }
 
+  /**
+   * Get the currently active sampling preset from loaded file-based presets.
+   */
+  getActivePreset(): SamplingPreset | undefined {
+    const name = this.config.activePreset || 'codegen';
+    return this.loadedPresets[name];
+  }
+
+  /**
+   * Initialize file-based preset system: ensure dir, load presets, set up file watcher.
+   */
+  private initializePresets(): void {
+    const configuredPath = vscode.workspace.getConfiguration('github.copilot.llm-gateway')
+      .get<string>('presetsPath', '');
+    this.presetsDir = resolvePresetsDir(configuredPath);
+
+    try {
+      ensurePresetsDir(this.presetsDir);
+      this.reloadPresetsFromDisk();
+      this.outputChannel.appendLine(`Presets directory: ${this.presetsDir} (${Object.keys(this.loadedPresets).length} presets loaded)`);
+    } catch (err) {
+      this.outputChannel.appendLine(`ERROR: Failed to initialize presets directory: ${err}`);
+    }
+
+    // Watch for preset file changes (create/modify/delete)
+    this.setupPresetWatcher();
+  }
+
+  /**
+   * Reload all presets from disk.
+   */
+  private reloadPresetsFromDisk(): void {
+    this.loadedPresets = loadPresetsFromDir(
+      this.presetsDir,
+      (msg: string) => this.outputChannel.appendLine(msg)
+    );
+    this.updatePresetStatusBar();
+  }
+
+  /**
+   * Set up a file system watcher on the presets directory for live reload.
+   */
+  private setupPresetWatcher(): void {
+    this.presetWatcher?.dispose();
+
+    const pattern = new vscode.RelativePattern(vscode.Uri.file(this.presetsDir), '*.json');
+    this.presetWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+
+    const reload = () => {
+      this.outputChannel.appendLine('Preset file changed, reloading presets...');
+      this.reloadPresetsFromDisk();
+    };
+    this.presetWatcher.onDidChange(reload);
+    this.presetWatcher.onDidCreate(reload);
+    this.presetWatcher.onDidDelete(reload);
+
+    this.context.subscriptions.push(this.presetWatcher);
+  }
+
+  /**
+   * Show quick pick for preset selection.
+   */
+  async showPresetPicker(): Promise<void> {
+    const allPresets = this.loadedPresets;
+    const currentPreset = this.config.activePreset || 'codegen';
+
+    interface PresetQuickPickItem extends vscode.QuickPickItem {
+      preset?: string;
+      action?: string;
+    }
+
+    const items: PresetQuickPickItem[] = Object.entries(allPresets).map(([key, preset]) => ({
+      label: `${key === currentPreset ? '$(check) ' : ''}${preset.name}`,
+      description: key === currentPreset ? '(active)' : '',
+      detail: `${preset.description}`,
+      preset: key,
+    }));
+
+    // Add separator and management actions
+    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+    items.push({
+      label: '$(folder-opened) Open Presets Folder',
+      detail: this.presetsDir,
+      action: 'openFolder',
+    });
+    items.push({
+      label: '$(add) Create New Preset',
+      detail: 'Create a new preset JSON file from a template',
+      action: 'create',
+    });
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: `Select Sampling Preset (backend: ${this.detectedBackend})`,
+      placeHolder: 'Choose a preset, or open the folder to edit',
+    });
+
+    if (!pick) return;
+
+    if (pick.action === 'openFolder') {
+      await this.openPresetsFolder();
+    } else if (pick.action === 'create') {
+      await this.createNewPreset();
+    } else if (pick.preset) {
+      await vscode.workspace.getConfiguration('github.copilot.llm-gateway')
+        .update('activePreset', pick.preset, vscode.ConfigurationTarget.Global);
+      this.outputChannel.appendLine(`Preset changed to: ${pick.preset}`);
+    }
+  }
+
+  /**
+   * Show a Quick Pick for selecting the global reasoning/thinking token budget.
+   * null = use preset/server default, 0 = off, -1 = unlimited, >0 = token limit.
+   */
+  async showReasoningBudgetPicker(): Promise<void> {
+    const current = this.config.reasoningBudget;
+
+    interface BudgetItem extends vscode.QuickPickItem {
+      value: number | null;
+    }
+
+    const options: BudgetItem[] = [
+      {
+        label: `${current === null ? '$(check) ' : ''}Server / Preset Default`,
+        description: current === null ? '(active)' : '',
+        detail: 'Do not send reasoning_budget — let the preset or server decide',
+        value: null,
+      },
+      {
+        label: `${current === 0 ? '$(check) ' : ''}Off (0)`,
+        description: current === 0 ? '(active)' : '',
+        detail: 'Disable thinking entirely (reasoning_budget=0)',
+        value: 0,
+      },
+      {
+        label: `${current === 1024 ? '$(check) ' : ''}Short (1 024 tokens)`,
+        description: current === 1024 ? '(active)' : '',
+        detail: 'Quick reasoning pass — suitable for simple tasks',
+        value: 1024,
+      },
+      {
+        label: `${current === 4096 ? '$(check) ' : ''}Medium (4 096 tokens)`,
+        description: current === 4096 ? '(active)' : '',
+        detail: 'Balanced reasoning depth',
+        value: 4096,
+      },
+      {
+        label: `${current === 16384 ? '$(check) ' : ''}Long (16 384 tokens)`,
+        description: current === 16384 ? '(active)' : '',
+        detail: 'Deep reasoning for complex problems',
+        value: 16384,
+      },
+      {
+        label: `${current === -1 ? '$(check) ' : ''}Unlimited (-1)`,
+        description: current === -1 ? '(active)' : '',
+        detail: 'No token cap on thinking (may be slow for large problems)',
+        value: -1,
+      },
+    ];
+
+    const pick = await vscode.window.showQuickPick(options, {
+      title: 'Select Reasoning Budget',
+      placeHolder: 'Thinking token limit (llama.cpp reasoning_budget)',
+    }) as BudgetItem | undefined;
+
+    if (!pick) return;
+
+    await vscode.workspace.getConfiguration('github.copilot.llm-gateway')
+      .update('reasoningBudget', pick.value, vscode.ConfigurationTarget.Global);
+
+    const label = pick.value === null
+      ? 'Server / Preset Default'
+      : pick.value === 0 ? 'Off'
+        : pick.value === -1 ? 'Unlimited'
+          : `${pick.value} tokens`;
+    vscode.window.showInformationMessage(`LLM Gateway: Reasoning budget set to ${label}`);
+    this.outputChannel.appendLine(`Reasoning budget changed to: ${pick.value}`);
+  }
+
+  /**
+   * Open the presets folder in VS Code file explorer and reveal the active preset file.
+   */
+  async openPresetsFolder(): Promise<void> {
+    const activeKey = this.config.activePreset || 'codegen';
+    const filePath = getPresetFilePath(this.presetsDir, activeKey);
+    try {
+      const doc = await vscode.workspace.openTextDocument(filePath);
+      await vscode.window.showTextDocument(doc);
+    } catch {
+      // If the active preset file doesn't exist, just open the folder
+      const uri = vscode.Uri.file(this.presetsDir);
+      await vscode.commands.executeCommand('revealFileInOS', uri);
+    }
+  }
+
+  /**
+   * Create a new preset from a template.
+   */
+  async createNewPreset(): Promise<void> {
+    const name = await vscode.window.showInputBox({
+      prompt: 'Preset key (lowercase, no spaces — becomes the filename)',
+      placeHolder: 'e.g. my-custom-preset',
+      validateInput: (val: string) => {
+        if (!val.trim()) return 'Name is required';
+        if (!/^[a-z0-9_-]+$/.test(val)) return 'Only lowercase letters, numbers, hyphens, underscores';
+        if (this.loadedPresets[val]) return `Preset '${val}' already exists`;
+        return null;
+      },
+    });
+    if (!name) return;
+
+    const displayName = await vscode.window.showInputBox({
+      prompt: 'Display name for the preset',
+      placeHolder: 'e.g. My Custom Preset',
+      value: name.charAt(0).toUpperCase() + name.slice(1),
+    });
+    if (!displayName) return;
+
+    const template: SamplingPreset = {
+      name: displayName,
+      description: 'Custom preset — edit params below',
+      backends: ['llamacpp', 'vllm', 'openai', 'unknown'],
+      params: {
+        temperature: 0.3,
+        top_p: 0.9,
+        top_k: 30,
+        min_p: 0.04,
+        repeat_penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+      },
+    };
+
+    const filePath = getPresetFilePath(this.presetsDir, name);
+    const content = JSON.stringify(template, null, 2) + '\n';
+    const { writeFileSync } = require('node:fs');
+    writeFileSync(filePath, content, 'utf-8');
+
+    // Open the file for editing
+    const doc = await vscode.workspace.openTextDocument(filePath);
+    await vscode.window.showTextDocument(doc);
+
+    vscode.window.showInformationMessage(`Preset '${name}' created. Edit the file and save — it will auto-reload.`);
+  }
+
+  /**
+   * Update status bar to show current preset and backend.
+   */
+  private updatePresetStatusBar(): void {
+    if (!this.presetStatusBarItem) {
+      this.presetStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+      this.presetStatusBarItem.command = 'github.copilot.llm-gateway.selectPreset';
+      this.context.subscriptions.push(this.presetStatusBarItem);
+    }
+    const preset = this.getActivePreset();
+    const presetName = preset?.name ?? this.config.activePreset;
+    this.presetStatusBarItem.text = `$(settings-gear) ${presetName}`;
+    this.presetStatusBarItem.tooltip = `LLM Gateway Preset: ${presetName} (${this.detectedBackend}) — Click to change`;
+    this.presetStatusBarItem.show();
+  }
+
   private dispose(): void {
     this.statusBarItem?.dispose();
+    this.presetStatusBarItem?.dispose();
+    this.presetWatcher?.dispose();
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Inline override parser: /temp 0.2  /preset codegen  /grammar {...}
+  // ──────────────────────────────────────────────────────────────────────────
+  private parseInlineOverrides(messages: Record<string, unknown>[]): {
+    temperature?: number;
+    preset?: string;
+    grammar?: string;
+    jsonSchema?: Record<string, unknown>;
+  } {
+    const result: { temperature?: number; preset?: string; grammar?: string; jsonSchema?: Record<string, unknown> } = {};
+    // Only look at the last user message
+    const last = [...messages].reverse().find((m) => m.role === 'user' && typeof m.content === 'string');
+    if (!last || typeof last.content !== 'string') return result;
+
+    const text = last.content;
+
+    // /temp 0.2 or /temperature 0.2
+    const tempMatch = text.match(/\/(?:temp|temperature)\s+([0-9]*\.?[0-9]+)/i);
+    if (tempMatch) {
+      const val = parseFloat(tempMatch[1]);
+      if (!isNaN(val) && val >= 0 && val <= 2) result.temperature = val;
+    }
+
+    // /preset codegen
+    const presetMatch = text.match(/\/preset\s+([a-z0-9_-]+)/i);
+    if (presetMatch) result.preset = presetMatch[1].toLowerCase();
+
+    // /grammar { ... } — rest of line is GBNF grammar string
+    const grammarMatch = text.match(/\/grammar\s+(.+)$/ms);
+    if (grammarMatch) result.grammar = grammarMatch[1].trim();
+
+    // /schema { ... } — JSON schema for structured output
+    const schemaMatch = text.match(/\/schema\s+(\{[\s\S]+\})/);
+    if (schemaMatch) {
+      try { result.jsonSchema = JSON.parse(schemaMatch[1]); } catch { /* ignore invalid */ }
+    }
+
+    return result;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Stats: update stored stats + status bar
+  // ──────────────────────────────────────────────────────────────────────────
+  private updateRequestStats(stats: RequestStats): void {
+    this.requestStats = stats;
+    this.updateStatsStatusBar();
+  }
+
+  private updateStatsStatusBar(): void {
+    if (!this.statusBarItem) return;
+    const { lastTokensPerSec, lastContextPercent, requestCount } = this.requestStats;
+    const ctxIcon = lastContextPercent >= 80 ? '$(warning)' : '$(pulse)';
+    this.statusBarItem.text = `$(hubot) ${lastTokensPerSec > 0 ? `${lastTokensPerSec}t/s` : 'LLM'} ${ctxIcon}${lastContextPercent}%`;
+    this.statusBarItem.tooltip = [
+      `LLM Gateway — ${requestCount} requests`,
+      `Last: ~${lastTokensPerSec} tokens/sec`,
+      `Context: ${lastContextPercent}% used`,
+      `Input tokens: ${this.requestStats.lastInputTokens}`,
+      `Output chars: ${this.requestStats.lastOutputChars}`,
+      'Click to open settings',
+    ].join('\n');
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Model stats command
+  // ──────────────────────────────────────────────────────────────────────────
+  async showModelStats(): Promise<void> {
+    const stats = this.requestStats;
+    const preset = this.getActivePreset();
+    const info = [
+      `**LLM Gateway — Model Stats**`,
+      ``,
+      `| | |`,
+      `|---|---|`,
+      `| Server | ${this.config.serverUrl} |`,
+      `| Backend | ${this.detectedBackend} |`,
+      `| Active Preset | ${preset?.name ?? this.config.activePreset} |`,
+      `| Total Requests | ${stats.requestCount} |`,
+      `| Last Speed | ~${stats.lastTokensPerSec} tokens/sec |`,
+      `| Last Context Use | ${stats.lastContextPercent}% |`,
+      `| Last Input Tokens | ${stats.lastInputTokens} |`,
+      `| Last Output Chars | ${stats.lastOutputChars} |`,
+    ].join('\n');
+
+    // Show as info message with "Open Output" action
+    const action = await vscode.window.showInformationMessage(
+      `LLM Gateway: ${stats.requestCount} requests | last ~${stats.lastTokensPerSec}t/s | ctx ${stats.lastContextPercent}%`,
+      'Open Output Log'
+    );
+    if (action === 'Open Output Log') {
+      this.outputChannel.show();
+    }
+    this.outputChannel.appendLine(info.replace(/\*\*/g, '').replace(/\|/g, '|'));
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Export conversation
+  // ──────────────────────────────────────────────────────────────────────────
+  async exportConversation(): Promise<void> {
+    if (!this.lastConversation || this.lastConversation.messages.length === 0) {
+      vscode.window.showWarningMessage('LLM Gateway: No conversation to export yet.');
+      return;
+    }
+
+    const { modelId, messages } = this.lastConversation;
+    const date = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const preset = this.getActivePreset();
+
+    const lines: string[] = [
+      `# LLM Gateway Conversation Export`,
+      ``,
+      `**Date:** ${new Date().toLocaleString()}  `,
+      `**Model:** ${modelId}  `,
+      `**Preset:** ${preset?.name ?? this.config.activePreset}  `,
+      `**Backend:** ${this.detectedBackend}  `,
+      ``,
+      `---`,
+      ``,
+    ];
+
+    for (const msg of messages) {
+      const roleLabel = msg.role === 'user' ? '👤 User' : msg.role === 'assistant' ? '🤖 Assistant' : '⚙️ System';
+      lines.push(`## ${roleLabel}`, ``);
+      if (msg.thinking) {
+        lines.push(`> **💭 Thinking**`);
+        msg.thinking.split('\n').forEach((l) => lines.push(`> ${l}`));
+        lines.push(``, `---`, ``);
+      }
+      lines.push(msg.content, ``, `---`, ``);
+    }
+
+    const content = lines.join('\n');
+    const defaultUri = vscode.Uri.file(`${process.env.HOME ?? '/tmp'}/llm-conversation-${date}.md`);
+
+    const saveUri = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { Markdown: ['md'], Text: ['txt'] },
+      title: 'Export Conversation',
+    });
+
+    if (!saveUri) return;
+
+    const { writeFileSync } = require('node:fs');
+    writeFileSync(saveUri.fsPath, content, 'utf-8');
+    const doc = await vscode.workspace.openTextDocument(saveUri);
+    await vscode.window.showTextDocument(doc);
+    vscode.window.showInformationMessage(`Conversation exported to ${saveUri.fsPath}`);
   }
 
   private reloadConfig(): void {
     this.config = this.loadConfig();
     this.client.updateConfig(this.config);
     this.modelMetadata.clear();
+
+    // Re-resolve presets dir if path setting changed
+    const configuredPath = vscode.workspace.getConfiguration('github.copilot.llm-gateway')
+      .get<string>('presetsPath', '');
+    const newDir = resolvePresetsDir(configuredPath);
+    if (newDir !== this.presetsDir) {
+      this.presetsDir = newDir;
+      ensurePresetsDir(this.presetsDir);
+      this.setupPresetWatcher();
+      this.outputChannel.appendLine(`Presets directory changed to: ${this.presetsDir}`);
+    }
+    this.reloadPresetsFromDisk();
+
     this.outputChannel.appendLine('Configuration reloaded, model metadata cache cleared');
   }
 }

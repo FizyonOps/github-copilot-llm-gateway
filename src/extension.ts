@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { GatewayProvider } from './provider';
+import { registerChatParticipant } from './participant';
 
 /**
  * Extension activation
@@ -48,6 +49,64 @@ export function activate(context: vscode.ExtensionContext) {
       () => provider.refreshModels()
     )
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.selectPreset',
+      () => provider.showPresetPicker()
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.openPresets',
+      () => provider.openPresetsFolder()
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.createPreset',
+      () => provider.createNewPreset()
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.showStats',
+      () => provider.showModelStats()
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.exportConversation',
+      () => provider.exportConversation()
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.switchPresetByName',
+      async (name: string) => {
+        const presets = provider.getPresets();
+        if (name && name in presets) {
+          await vscode.workspace.getConfiguration('github.copilot.llm-gateway')
+            .update('activePreset', name, vscode.ConfigurationTarget.Global);
+          vscode.window.showInformationMessage(`LLM Gateway: Switched to "${presets[name].name}" preset`);
+        }
+      }
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'github.copilot.llm-gateway.selectReasoningBudget',
+      () => provider.showReasoningBudgetPicker()
+    )
+  );
+
+  registerChatParticipant(context, provider);
 
   context.subscriptions.push(outputChannel);
 

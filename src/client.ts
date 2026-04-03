@@ -51,6 +51,13 @@ interface ParsedChunk {
     }>;
     function_call?: { name?: string; arguments?: string };
   };
+  /** llama.cpp sometimes sends tool_calls directly at choice level */
+  choiceToolCalls?: Array<{
+    index?: number;
+    id?: string;
+    type?: string;
+    function?: { name?: string; arguments?: string };
+  }>;
   finishReason?: string;
   id?: string;
 }
@@ -280,10 +287,13 @@ export class GatewayClient {
   private parseSSEData(data: string): ParsedChunk | null {
     try {
       const parsed = JSON.parse(data);
+      const choice = parsed.choices?.[0];
       return {
-        delta: parsed.choices?.[0]?.delta,
-        message: parsed.choices?.[0]?.message,
-        finishReason: parsed.choices?.[0]?.finish_reason,
+        delta: choice?.delta,
+        message: choice?.message,
+        // llama.cpp sends tool_calls directly at choice level (not nested in message/delta)
+        choiceToolCalls: choice?.tool_calls,
+        finishReason: choice?.finish_reason,
         id: parsed.id,
       };
     } catch (parseError) {
@@ -320,6 +330,24 @@ export class GatewayClient {
     if (parsed.message) {
       const { content, reasoning_content, finishedToolCalls } = this.processMessageFormat(parsed, state);
       return { content, reasoning_content, tool_calls: [], finished_tool_calls: finishedToolCalls };
+    }
+
+    // llama.cpp: tool_calls directly at choice level (not in message/delta)
+    if (parsed.choiceToolCalls && Array.isArray(parsed.choiceToolCalls)) {
+      const finishedToolCalls: StreamingToolCall[] = [];
+      for (let i = 0; i < parsed.choiceToolCalls.length; i++) {
+        const tc = parsed.choiceToolCalls[i];
+        const index = tc.index ?? i;
+        if (!state.finalizedIndices.has(index)) {
+          state.finalizedIndices.add(index);
+          finishedToolCalls.push({
+            id: tc.id || `call_${state.requestId}_${index}`,
+            name: tc.function?.name || '',
+            arguments: tc.function?.arguments || '',
+          });
+        }
+      }
+      return { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: finishedToolCalls };
     }
 
     return null;
@@ -460,6 +488,54 @@ export class GatewayClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * Fetch server properties from /props (llama.cpp specific).
+   * Returns null if the endpoint is not available (non-llamacpp servers).
+   */
+  public async fetchProps(): Promise<{ chat_template?: string; chat_template_explicit_reasoning?: boolean; total_slots?: number; model_path?: string } | null> {
+    const url = `${this.config.serverUrl}/props`;
+    try {
+      const response = await this.fetch(url, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return await response.json() as any;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Non-streaming chat completion (used for internal tasks like condensation).
+   */
+  public async chatComplete(
+    request: OpenAIChatCompletionRequest,
+    cancellationToken: vscode.CancellationToken
+  ): Promise<string> {
+    const url = `${this.config.serverUrl}/v1/chat/completions`;
+
+    if (cancellationToken.isCancellationRequested) {
+      throw new Error('Request cancelled');
+    }
+
+    const response = await this.fetch(url, {
+      method: 'POST',
+      headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...request, stream: false }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Chat completion failed: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+
+    const data = await response.json() as any;
+    return data.choices?.[0]?.message?.content ?? '';
   }
 
   /**

@@ -44,6 +44,37 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "llm-gateway",
+        "fullName": "LLM Gateway",
+        "name": "llm-gateway",
+        "description": "Stats, presets, config, and changelog for your LLM Gateway",
+        "isSticky": false,
+        "commands": [
+          {
+            "name": "stats",
+            "description": "Server stats, speed, and context usage"
+          },
+          {
+            "name": "presets",
+            "description": "List all sampling presets with parameters"
+          },
+          {
+            "name": "preset",
+            "description": "Switch active preset by name"
+          },
+          {
+            "name": "config",
+            "description": "Show current configuration"
+          },
+          {
+            "name": "changelog",
+            "description": "What's new in this version"
+          }
+        ]
+      }
+    ],
     "languageModelChatProviders": [
       {
         "vendor": "copilot-llm-gateway",
@@ -59,6 +90,36 @@
       {
         "command": "github.copilot.llm-gateway.refreshModels",
         "title": "Refresh Models",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.selectPreset",
+        "title": "Select Sampling Preset",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.openPresets",
+        "title": "Open Presets Folder",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.createPreset",
+        "title": "Create New Preset",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.showStats",
+        "title": "Show Model Stats",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.exportConversation",
+        "title": "Export Conversation",
+        "category": "LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.selectReasoningBudget",
+        "title": "Select Reasoning Budget",
         "category": "LLM Gateway"
       }
     ],
@@ -171,6 +232,57 @@
           ],
           "description": "Regex patterns stripped from non-tool prompt text before requests are sent to the model.",
           "order": 14
+        },
+        "github.copilot.llm-gateway.activePreset": {
+          "type": "string",
+          "default": "codegen",
+          "description": "Active sampling preset name. Controls temperature, top_p, min_p, repeat_penalty, and other sampling parameters sent per-request. Must match a preset filename (without .json) in the presets directory. Use 'LLM Gateway: Select Sampling Preset' command for quick switching.",
+          "order": 15
+        },
+        "github.copilot.llm-gateway.presetsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Directory path for sampling preset JSON files. Each preset is a separate .json file you can edit directly. Leave empty to use default (~/.config/llm-gateway/presets/). Supports ~ for home directory.",
+          "order": 16
+        },
+        "github.copilot.llm-gateway.showThinking": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show model's thinking/reasoning process in a collapsible section before the response. When disabled, thinking is logged to output channel only.",
+          "order": 17
+        },
+        "github.copilot.llm-gateway.reasoningBudget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "description": "Global reasoning/thinking token budget override. null = use preset or server default; 0 = disable thinking; -1 = unlimited; positive = max thinking tokens. Use 'LLM Gateway: Select Reasoning Budget' command for quick switching.",
+          "order": 18
+        },
+        "github.copilot.llm-gateway.reasoningFormat": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "deepseek",
+            "none"
+          ],
+          "enumDescriptions": [
+            "Auto-detect from chat template (uses /props chat_template_explicit_reasoning)",
+            "Force reasoning_format=deepseek — stream thinking as separate reasoning_content (use when your model supports <think> but template is not auto-detected)",
+            "Force reasoning_format=none — disable thinking separation entirely"
+          ],
+          "description": "How to handle model thinking/reasoning in streaming responses. 'auto' detects from the server's chat template. Set to 'deepseek' to force thinking separation for models like Qwen3 running with generic ChatML template.",
+          "order": 19
+        },
+        "github.copilot.llm-gateway.contextCondensationThreshold": {
+          "type": "integer",
+          "default": 80,
+          "minimum": 40,
+          "maximum": 95,
+          "description": "Context usage percentage at which automatic LLM-based conversation condensation is triggered. Older messages are summarized by the model to free context space. Set to 95 to effectively disable.",
+          "order": 20
         }
       }
     }
