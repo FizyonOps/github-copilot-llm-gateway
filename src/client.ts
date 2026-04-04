@@ -194,6 +194,23 @@ export class GatewayClient {
   }
 
   /**
+   * Only finalize streamed tool calls once the accumulated arguments form valid JSON.
+   * Some backends emit finish_reason before the last argument chunks arrive.
+   */
+  private isToolCallReadyForFinalization(toolCall: StreamingToolCall): boolean {
+    if (!toolCall.name || toolCall.arguments.trim() === '') {
+      return false;
+    }
+
+    try {
+      JSON.parse(toolCall.arguments);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Finalize all pending tool calls
    */
   private finalizeToolCalls(state: ToolCallState): StreamingToolCall[] {
@@ -201,6 +218,12 @@ export class GatewayClient {
 
     for (const [index, tc] of state.toolCallsByIndex.entries()) {
       if (!state.finalizedIndices.has(index)) {
+        if (!this.isToolCallReadyForFinalization(tc)) {
+          console.warn(
+            `[LLM Gateway] Delaying tool call finalization for index ${index}; arguments are not valid JSON yet.`
+          );
+          continue;
+        }
         state.finalizedIndices.add(index);
         if (!tc.id) {
           tc.id = `call_${state.requestId}_${index}`;
@@ -297,6 +320,8 @@ export class GatewayClient {
         id: parsed.id,
       };
     } catch (parseError) {
+      const preview = data.length > 300 ? `${data.substring(0, 300)}...` : data;
+      console.warn(`[LLM Gateway] Failed to parse SSE data chunk (${data.length} chars): ${preview}`, parseError);
       return null;
     }
   }
@@ -387,6 +412,8 @@ export class GatewayClient {
   ): AsyncGenerator<{ content: string; reasoning_content: string; tool_calls: StreamingToolCall[]; finished_tool_calls: StreamingToolCall[] }, void, unknown> {
     const url = `${this.config.serverUrl}/v1/chat/completions`;
     const state = this.createToolCallState();
+    let activeRequestCleanup: (() => void) | undefined;
+    let shouldEmitRemainingToolCalls = true;
 
     try {
       let response: Response | undefined;
@@ -397,17 +424,43 @@ export class GatewayClient {
           throw new Error('Request cancelled');
         }
 
-        response = await this.fetch(url, {
-          method: 'POST',
-          headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...request, stream: true }),
+        const attemptController = new AbortController();
+        const timeoutId = setTimeout(() => attemptController.abort(), this.config.requestTimeout);
+        const cancellationSubscription = cancellationToken.onCancellationRequested(() => {
+          attemptController.abort();
         });
+        const cleanupAttempt = () => {
+          clearTimeout(timeoutId);
+          cancellationSubscription.dispose();
+        };
+
+        try {
+          response = await fetch(url, {
+            method: 'POST',
+            headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...request, stream: true }),
+            signal: attemptController.signal,
+          });
+        } catch (error) {
+          cleanupAttempt();
+          if (cancellationToken.isCancellationRequested || attemptController.signal.aborted) {
+            throw new Error('Request cancelled');
+          }
+          throw error;
+        }
 
         if (response.ok) {
+          // Clear request timeout now that we have a successful HTTP response.
+          // Per-chunk idle timeouts are handled by provider.ts logic.
+          clearTimeout(timeoutId);
+          activeRequestCleanup = () => {
+            cancellationSubscription.dispose();
+          };
           break;
         }
 
         const errorText = await response.text();
+        cleanupAttempt();
         lastError = new Error(`Chat completion failed: ${response.status} ${response.statusText} - ${errorText}`);
 
         if (response.status === 400 && errorText.includes('exceed_context_size_error')) {
@@ -427,7 +480,37 @@ export class GatewayClient {
 
         const delay = retryDelay * Math.pow(2, attempt);
         console.warn(`[LLM Gateway] Retry ${attempt + 1}/${maxRetries} after ${response.status}, next attempt in ${delay}ms`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+
+        // Fix TDZ and synchronous cancellation race condition with guard flag
+        let disposed = false;
+        let retryCancelSub: vscode.Disposable | undefined;
+
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            if (!disposed) {
+              disposed = true;
+              retryCancelSub?.dispose();
+              resolve();
+            }
+          }, delay);
+
+          retryCancelSub = cancellationToken.onCancellationRequested(() => {
+            if (!disposed) {
+              disposed = true;
+              clearTimeout(timer);
+              retryCancelSub?.dispose();
+              reject(new Error('Request cancelled'));
+            }
+          });
+
+          // Handle already-cancelled token synchronously to prevent hanging promise  
+          if (cancellationToken.isCancellationRequested && !disposed) {
+            disposed = true;
+            clearTimeout(timer);
+            retryCancelSub?.dispose();
+            reject(new Error('Request cancelled'));
+          }
+        });
       }
 
       if (!response || !response.ok) {
@@ -461,6 +544,9 @@ export class GatewayClient {
 
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length > MAX_BUFFER_SIZE) {
+          console.warn(
+            `[LLM Gateway] SSE buffer exceeded ${MAX_BUFFER_SIZE} chars; discarding oldest buffered data to stay within memory budget.`
+          );
           const truncated = buffer.slice(-MAX_BUFFER_SIZE);
           const firstNewline = truncated.indexOf('\n');
           buffer = firstNewline >= 0 ? truncated.slice(firstNewline + 1) : truncated;
@@ -473,20 +559,25 @@ export class GatewayClient {
           if (result) { yield result; }
         }
       }
-
-      // Finalize any remaining tool calls
-      const remaining = this.getRemainingToolCalls(state);
-      if (remaining.length > 0) {
-        yield { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: remaining };
-      }
     } catch (error: any) {
+      shouldEmitRemainingToolCalls = false;
       if (error?.isContextOverflow) {
         throw error;
       }
       if (error instanceof Error) {
-        throw new Error(`Chat completion request failed: ${error.message}`);
+        const normalizedMessage = cancellationToken.isCancellationRequested ? 'Request cancelled' : error.message;
+        throw new Error(`Chat completion request failed: ${normalizedMessage}`);
       }
       throw error;
+    } finally {
+      activeRequestCleanup?.();
+
+      if (shouldEmitRemainingToolCalls) {
+        const remaining = this.getRemainingToolCalls(state);
+        if (remaining.length > 0) {
+          yield { content: '', reasoning_content: '', tool_calls: [], finished_tool_calls: remaining };
+        }
+      }
     }
   }
 
@@ -527,7 +618,7 @@ export class GatewayClient {
       method: 'POST',
       headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...request, stream: false }),
-    });
+    }, cancellationToken);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -554,9 +645,22 @@ export class GatewayClient {
   /**
    * Fetch wrapper with timeout support
    */
-  private async fetch(url: string, options: RequestInit): Promise<Response> {
+  private async fetch(
+    url: string,
+    options: RequestInit,
+    cancellationToken?: vscode.CancellationToken
+  ): Promise<Response> {
+    return this.fetchWithCancellation(url, options, cancellationToken);
+  }
+
+  private async fetchWithCancellation(
+    url: string,
+    options: RequestInit,
+    cancellationToken?: vscode.CancellationToken
+  ): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    const cancellationSubscription = cancellationToken?.onCancellationRequested(() => controller.abort());
 
     try {
       const response = await fetch(url, {
@@ -564,8 +668,14 @@ export class GatewayClient {
         signal: controller.signal,
       });
       return response;
+    } catch (error) {
+      if (cancellationToken?.isCancellationRequested || controller.signal.aborted) {
+        throw new Error('Request cancelled');
+      }
+      throw error;
     } finally {
       clearTimeout(timeoutId);
+      cancellationSubscription?.dispose();
     }
   }
 }

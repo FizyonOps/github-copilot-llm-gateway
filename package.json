@@ -141,7 +141,7 @@
         "github.copilot.llm-gateway.requestTimeout": {
           "type": "number",
           "default": 300000,
-          "description": "Request timeout in milliseconds. Increase for large prompts on local models.",
+          "description": "Request timeout in milliseconds. For streaming requests this applies until the initial HTTP response begins; use streamingIdleTimeout for gaps between streamed chunks.",
           "order": 3
         },
         "github.copilot.llm-gateway.defaultMaxTokens": {
@@ -194,7 +194,7 @@
         "github.copilot.llm-gateway.streamingIdleTimeout": {
           "type": "number",
           "default": 120000,
-          "description": "Maximum time in milliseconds to wait for the next streaming chunk before timing out. Increase for large prompts on local models where prefill is slow. Set to 0 to disable.",
+          "description": "Maximum time in milliseconds to wait for the next streaming chunk before timing out after streaming has started. Increase for slow local models. Set to 0 to disable the idle chunk timeout.",
           "order": 10
         },
         "github.copilot.llm-gateway.maxRetries": {

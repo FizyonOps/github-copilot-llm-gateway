@@ -148,6 +148,14 @@ These settings control how the extension handles agentic features like code edit
 | **System Prompt**             | _(empty)_                | System prompt prepended to every conversation                                              |
 | **Prompt Strip Patterns**     | Built-in safe patterns   | Regex patterns stripped from non-tool prompt text before requests are sent to the model    |
 
+### Context Management
+
+| Setting                             | Default | Description                                                                                       |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| **Context Condensation Threshold**  | `80`    | When estimated context usage reaches this percentage, older turns are summarized before truncation |
+
+When a chat grows too large, LLM Gateway first tries to condense older history into a compact summary message. If the request is still too large after condensation, it falls back to mechanical truncation of older content and bulky tool results.
+
 ### Workspace Custom Instructions
 
 LLM Gateway automatically includes standard workspace instruction files in chat requests, so repository guidance reaches your self-hosted model instead of only the built-in Copilot models.
@@ -255,6 +263,38 @@ The model failed to generate output. Try:
 2. **Disable tool calling** — Set `github.copilot.llm-gateway.enableToolCalling` to `false` to test basic chat
 3. **Reduce context** — Your conversation may exceed the model's limit
 
+### Large conversations still hit context limits
+
+LLM Gateway automatically tries to condense older conversation history before hard truncation once the chat reaches `github.copilot.llm-gateway.contextCondensationThreshold`.
+
+If you still see overflow behavior:
+
+1. Lower `github.copilot.llm-gateway.contextCondensationThreshold` so condensation starts earlier
+2. Reduce large tool outputs in the chat thread by starting a fresh conversation after heavy agent/tool usage
+3. Increase your server-side context window if the model/runtime supports it
+
+### Selected model changes after a failure
+
+Transient gateway failures should no longer make LLM Gateway models disappear from VS Code's model list. The extension now keeps the last known model catalog cached and reports request failures inline in chat instead of surfacing them as hard provider failures.
+
+If you still see the selector move away from an LLM Gateway model, check the "GitHub Copilot LLM Gateway" output channel first to confirm whether the failure came from the gateway provider or from a separate Copilot/MCP sampling path.
+
+### "Streaming idle timeout after 120000ms"
+
+`requestTimeout` and `streamingIdleTimeout` are separate controls:
+
+1. `requestTimeout` limits the initial wait for a streaming response to start, and still applies to non-streaming requests
+2. `streamingIdleTimeout` limits how long to wait between streamed chunks once streaming has started
+
+Current behavior:
+
+1. If `streamingIdleTimeout` is not explicitly set, it now follows `requestTimeout`
+2. If you want a different idle timeout, set `github.copilot.llm-gateway.streamingIdleTimeout` directly
+3. Set `streamingIdleTimeout` to `0` to disable idle chunk timeout
+4. Initial wait for the first streamed chunk uses `requestTimeout` (so slow model prefill does not trip idle timeout too early)
+
+For llama.cpp templates that occasionally emit `<tool_call>` blocks instead of structured tool chunks, LLM Gateway includes a fallback parser that can recover those tagged tool calls. Short planning prose plus a tagged tool call is allowed, but transcript-like echoed history containing prior `<tool_call>` blocks is ignored so quoted chat logs are not executed as tools.
+
 ### Tools described but not executed
 
 The model outputs text like "Using the read_file tool..." instead of actually calling tools.
@@ -269,6 +309,16 @@ The model outputs text like "Using the read_file tool..." instead of actually ca
 2. Set **Agent Temperature** to `0.0`
 3. Disable **Parallel Tool Calling**
 4. Ensure server has `--enable-auto-tool-choice` flag
+
+### Tool call references a file from another repository
+
+If the model emits an absolute path from a different project (for example from stale chat history), LLM Gateway now applies workspace path boundaries:
+
+1. The gateway first tries to remap obvious stale absolute paths to an equivalent file in the current workspace
+2. Absolute paths that still point outside the active workspace are blocked instead of being forwarded to tools
+3. A workspace-path guard is injected into the system prompt to prefer workspace-local paths
+
+If a tool call still fails, clear the chat thread and retry so the model rebuilds context from the current workspace only.
 
 ### Out of memory errors
 

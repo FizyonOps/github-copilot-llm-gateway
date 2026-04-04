@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { existsSync } from 'node:fs';
+import * as path from 'node:path';
 import { GatewayClient } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, RequestStats } from './types';
 import { collectWorkspaceInstructionFiles } from './instructions';
@@ -38,6 +40,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private statusBarItem: vscode.StatusBarItem | undefined;
   private presetStatusBarItem: vscode.StatusBarItem | undefined;
   private readonly modelMetadata: Map<string, { maxTokens: number; maxOutputTokens: number }> = new Map();
+  private lastKnownModels: vscode.LanguageModelChatInformation[] = [];
   private detectedBackend: BackendType = 'unknown';
   private detectedTemplate: TemplateCaps = { template: 'unknown', supportsToolRole: true, supportsSystemRole: true, hasNativeThinking: false };
   private presetsDir: string = '';
@@ -507,11 +510,359 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       sections.push(workspaceInstructionsPrompt);
     }
 
+    const workspacePathGuardPrompt = this.buildWorkspacePathGuardPrompt();
+    if (workspacePathGuardPrompt) {
+      sections.push(workspacePathGuardPrompt);
+    }
+
     if (sections.length === 0) {
       return undefined;
     }
 
     return sections.join('\n\n');
+  }
+
+  private getWorkspaceRoots(): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => path.normalize(folder.uri.fsPath))
+      .filter((root) => root.length > 0);
+  }
+
+  private isWithinWorkspaceRoots(candidatePath: string, workspaceRoots: readonly string[]): boolean {
+    const normalizedCandidate = path.normalize(candidatePath);
+    for (const root of workspaceRoots) {
+      if (normalizedCandidate === root || normalizedCandidate.startsWith(root + path.sep)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private normalizePathArgument(rawPath: string): string {
+    if (rawPath.startsWith('file://')) {
+      try {
+        return path.normalize(vscode.Uri.parse(rawPath).fsPath);
+      } catch {
+        return path.normalize(rawPath);
+      }
+    }
+
+    return path.normalize(rawPath);
+  }
+
+  private tryRemapToWorkspacePath(sourcePath: string, workspaceRoots: readonly string[]): string | undefined {
+    const normalizedSource = path.normalize(sourcePath);
+    const pathParts = normalizedSource.split(path.sep).filter(Boolean);
+
+    if (pathParts.length < 2) {
+      return undefined;
+    }
+
+    const srcIndex = pathParts.indexOf('src');
+    if (srcIndex >= 0 && srcIndex < pathParts.length - 1) {
+      const sourceSuffix = pathParts.slice(srcIndex);
+      for (const root of workspaceRoots) {
+        const candidate = path.join(root, ...sourceSuffix);
+        if (existsSync(candidate)) {
+          return candidate;
+        }
+      }
+    }
+
+    const maxSuffixDepth = Math.min(pathParts.length, 8);
+    for (let suffixDepth = maxSuffixDepth; suffixDepth >= 2; suffixDepth--) {
+      const sourceSuffix = pathParts.slice(-suffixDepth);
+      for (const root of workspaceRoots) {
+        const candidate = path.join(root, ...sourceSuffix);
+        if (existsSync(candidate)) {
+          return candidate;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private sanitizeWorkspacePathArgument(
+    toolName: string,
+    argumentName: string,
+    value: string,
+    workspaceRoots: readonly string[]
+  ): string | undefined {
+    const trimmedValue = value.trim();
+    if (!trimmedValue || /^https?:\/\//i.test(trimmedValue) || /^untitled:/i.test(trimmedValue)) {
+      return value;
+    }
+
+    const normalizedPath = this.normalizePathArgument(trimmedValue);
+    if (!path.isAbsolute(normalizedPath)) {
+      return value;
+    }
+
+    if (this.isWithinWorkspaceRoots(normalizedPath, workspaceRoots)) {
+      return normalizedPath;
+    }
+
+    const remappedPath = this.tryRemapToWorkspacePath(normalizedPath, workspaceRoots);
+    if (remappedPath) {
+      this.outputChannel.appendLine(`  Remapped ${toolName}.${argumentName}: ${normalizedPath} -> ${remappedPath}`);
+      return remappedPath;
+    }
+
+    // Enhanced logging for security diagnostics
+    const pathType = path.isAbsolute(trimmedValue) ? 'absolute' : 'relative';
+    this.outputChannel.appendLine(`⚠️ SECURITY WARNING: ${toolName}.${argumentName} points outside workspace roots`);
+    this.outputChannel.appendLine(`  Path type: ${pathType}`);
+    this.outputChannel.appendLine(`  Actual path: ${normalizedPath}`);
+    this.outputChannel.appendLine(`  Workspace roots being compared:`);
+    for (const root of workspaceRoots) {
+      this.outputChannel.appendLine(`    - ${root}`);
+    }
+    this.outputChannel.appendLine(`  → Blocking tool call until the model provides a workspace-local path`);
+    return undefined;
+  }
+
+  private sanitizeToolPathArguments(toolName: string, args: Record<string, unknown>): {
+    args: Record<string, unknown>;
+    blockedPathArguments: string[];
+  } {
+    const normalizedToolName = toolName.toLowerCase();
+    if (
+      normalizedToolName.includes('memory')
+      || normalizedToolName.includes('gemini')
+      || normalizedToolName.includes('chrome')
+      || normalizedToolName.includes('browser')
+      || normalizedToolName.includes('network')
+      || normalizedToolName.includes('bookmark')
+      || normalizedToolName.includes('history')
+    ) {
+      return { args, blockedPathArguments: [] };
+    }
+
+    const workspaceRoots = this.getWorkspaceRoots();
+    if (workspaceRoots.length === 0) {
+      return { args, blockedPathArguments: [] };
+    }
+
+    const sanitizedArgs: Record<string, unknown> = { ...args };
+    const blockedPathArguments: string[] = [];
+    const pathArgumentKeys = ['filePath', 'path', 'dirPath', 'workspaceFolder', 'includePattern'];
+
+    for (const key of pathArgumentKeys) {
+      const rawValue = sanitizedArgs[key];
+      if (typeof rawValue === 'string') {
+        const sanitizedValue = this.sanitizeWorkspacePathArgument(toolName, key, rawValue, workspaceRoots);
+        if (sanitizedValue === undefined) {
+          blockedPathArguments.push(key);
+          delete sanitizedArgs[key];
+        } else {
+          sanitizedArgs[key] = sanitizedValue;
+        }
+      }
+    }
+
+    const filePathsValue = sanitizedArgs.filePaths;
+    if (Array.isArray(filePathsValue)) {
+      const safeFilePaths: unknown[] = [];
+      filePathsValue.forEach((entry, index) => {
+        if (typeof entry !== 'string') {
+          safeFilePaths.push(entry);
+          return;
+        }
+        const sanitizedValue = this.sanitizeWorkspacePathArgument(toolName, `filePaths[${index}]`, entry, workspaceRoots);
+        if (sanitizedValue === undefined) {
+          blockedPathArguments.push(`filePaths[${index}]`);
+          return;
+        }
+        safeFilePaths.push(sanitizedValue);
+      });
+      sanitizedArgs.filePaths = safeFilePaths;
+    }
+
+    return { args: sanitizedArgs, blockedPathArguments };
+  }
+
+  private coerceTaggedParameterValue(rawValue: string): unknown {
+    const trimmed = rawValue.trim();
+    if (trimmed === '') {
+      return '';
+    }
+
+    if (/^-?\d+$/.test(trimmed)) {
+      const parsedInt = Number.parseInt(trimmed, 10);
+      if (Number.isFinite(parsedInt)) {
+        return parsedInt;
+      }
+    }
+
+    if (/^-?\d*\.\d+$/.test(trimmed)) {
+      const parsedFloat = Number.parseFloat(trimmed);
+      if (Number.isFinite(parsedFloat)) {
+        return parsedFloat;
+      }
+    }
+
+    if (/^true$/i.test(trimmed)) {
+      return true;
+    }
+
+    if (/^false$/i.test(trimmed)) {
+      return false;
+    }
+
+    if (/^null$/i.test(trimmed)) {
+      return null;
+    }
+
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return trimmed;
+      }
+    }
+
+    return trimmed;
+  }
+
+  private extractTaggedToolCalls(text: string): {
+    remainingText: string;
+    toolCalls: Array<{ id: string; name: string; arguments: string }>;
+  } {
+    if (!text) {
+      return { remainingText: text, toolCalls: [] };
+    }
+
+    const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+    const toolCallRegex = /<tool_call>\s*([\s\S]*?)<\/tool_call>/gi;
+    const callIdSeed = Date.now().toString(36);
+    let match: RegExpExecArray | null;
+
+    while ((match = toolCallRegex.exec(text)) !== null) {
+      const toolBlock = match[1] || '';
+      const functionMatch = /<function=([^\s>]+)>\s*([\s\S]*?)<\/function>/i.exec(toolBlock);
+      if (!functionMatch) {
+        continue;
+      }
+
+      const functionName = functionMatch[1].trim();
+      if (!functionName) {
+        continue;
+      }
+
+      const paramsBlock = functionMatch[2] || '';
+      const params: Record<string, unknown> = {};
+      const parameterRegex = /<parameter=([^\s>]+)>\s*([\s\S]*?)<\/parameter>/gi;
+      let parameterMatch: RegExpExecArray | null;
+
+      while ((parameterMatch = parameterRegex.exec(paramsBlock)) !== null) {
+        const paramName = parameterMatch[1].trim();
+        if (!paramName) {
+          continue;
+        }
+        params[paramName] = this.coerceTaggedParameterValue(parameterMatch[2] || '');
+      }
+
+      toolCalls.push({
+        id: `tagged_${callIdSeed}_${toolCalls.length}`,
+        name: functionName,
+        arguments: JSON.stringify(params),
+      });
+    }
+
+    if (toolCalls.length === 0) {
+      return { remainingText: text, toolCalls };
+    }
+
+    const remainingText = text
+      .replace(/<tool_call>\s*[\s\S]*?<\/tool_call>/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    return { remainingText, toolCalls };
+  }
+
+  private isPureTaggedToolCallPayload(text: string): boolean {
+    if (!text.trim()) {
+      return false;
+    }
+
+    const stripped = text.replace(/<tool_call>\s*[\s\S]*?<\/tool_call>/gi, '').trim();
+    return stripped.length === 0;
+  }
+
+  private containsTranscriptLikeTaggedToolCallMarkers(text: string): boolean {
+    const markers = [
+      '<|im_start|>',
+      '<|im_end|>',
+      '<tool_response>',
+      '"role":',
+      '"tool_calls"',
+      '[{"$mid"',
+      '```',
+    ];
+
+    return markers.some((marker) => text.includes(marker));
+  }
+
+  private getRecoverableTaggedToolCalls(
+    text: string,
+    sourceLabel: string
+  ): {
+    remainingText: string;
+    toolCalls: Array<{ id: string; name: string; arguments: string }>;
+  } | undefined {
+    if (!text.trim() || !text.includes('<tool_call>')) {
+      return undefined;
+    }
+
+    const extracted = this.extractTaggedToolCalls(text);
+    if (extracted.toolCalls.length === 0) {
+      return undefined;
+    }
+
+    if (this.isPureTaggedToolCallPayload(text)) {
+      return extracted;
+    }
+
+    if (this.containsTranscriptLikeTaggedToolCallMarkers(text)) {
+      this.outputChannel.appendLine(
+        `Skipped tagged tool-call fallback for ${sourceLabel}: response looks like echoed transcript content.`
+      );
+      return undefined;
+    }
+
+    const remainingText = extracted.remainingText.trim();
+    const lineCount = remainingText ? remainingText.split(/\r?\n/).length : 0;
+    const isShortMixedPreamble = remainingText.length <= 1600 && lineCount <= 24;
+
+    if (isShortMixedPreamble) {
+      this.outputChannel.appendLine(
+        `Recovering tagged tool calls from ${sourceLabel} with short mixed prose preamble (${remainingText.length} chars, ${lineCount} lines).`
+      );
+      return extracted;
+    }
+
+    this.outputChannel.appendLine(
+      `Skipped tagged tool-call fallback for ${sourceLabel}: mixed content was too large to trust (${remainingText.length} chars, ${lineCount} lines).`
+    );
+    return undefined;
+  }
+
+  private buildWorkspacePathGuardPrompt(): string | undefined {
+    const workspaceRoots = this.getWorkspaceRoots();
+    if (workspaceRoots.length === 0) {
+      return undefined;
+    }
+
+    const listedRoots = workspaceRoots.map((root) => `- ${root}`).join('\n');
+    return [
+      'Workspace path boundaries for tool calls:',
+      'Use only files and folders inside the active workspace roots below.',
+      listedRoots,
+      'Prefer workspace-relative paths when a tool supports both absolute and relative paths.',
+      'If an absolute path is outside these roots, do not use it directly in tool arguments.',
+    ].join('\n');
   }
 
   /**
@@ -682,17 +1033,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // Attempt repairs for common issues
     let repaired = jsonStr.trim();
 
-    // Fix missing closing brackets/braces
+    // Fix truncated string value - close the string if odd number of quotes
+    if (this.countChar(repaired, '"') % 2 !== 0) {
+      repaired += '"';
+    }
+
+    // Fix missing closing brackets/braces after repairing quotes so appended braces
+    // do not get swallowed into an unterminated string value.
     repaired = this.balanceBrackets(repaired);
 
     // Fix trailing comma before closing brace/bracket
     repaired = repaired.replaceAll(/,\s*([}\]])/g, '$1');
-
-    // Fix truncated string value - close the string if odd number of quotes
-    if (this.countChar(repaired, '"') % 2 !== 0) {
-      repaired += '"';
-      repaired = this.balanceBrackets(repaired);
-    }
 
     try {
       const result = JSON.parse(repaired);
@@ -858,6 +1209,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
           if (contentLen > toolResultCharLimit) {
             this.outputChannel.appendLine(`    Skipping large tool result (${contentLen} chars)`);
+            // Also remove the preceding assistant message with matching tool_calls to maintain pairing integrity
+            const previousMessage = result.length > 0 ? result[result.length - 1] : undefined;
+            const previousToolCalls = Array.isArray(previousMessage?.tool_calls) ? previousMessage.tool_calls as any[] : [];
+            const toolCallId = typeof truncated[i].tool_call_id === 'string' ? truncated[i].tool_call_id : undefined;
+            const hasMatchingToolCall = toolCallId
+              ? previousToolCalls.some((toolCall: any) => toolCall?.id === toolCallId)
+              : previousToolCalls.length > 0;
+            if (previousMessage?.role === 'assistant' && hasMatchingToolCall) {
+              result.pop();
+              this.outputChannel.appendLine(`    Also removing paired assistant tool call message`);
+            }
             continue;
           }
         }
@@ -879,12 +1241,16 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         if (truncated[i].content && typeof truncated[i].content === 'string') {
           const originalLen = truncated[i].content.length;
           if (originalLen > compressThreshold) {
-            truncated[i].content = this.truncateTextToTokenBudget(
-              truncated[i].content,
-              compressTargetTokens,
-              'content'
-            );
-            this.outputChannel.appendLine(`    Compressed message ${i}: ${originalLen} → ${truncated[i].content.length} chars`);
+            // Use object spread to create a new message object instead of mutating shared references
+            truncated[i] = {
+              ...truncated[i],
+              content: this.truncateTextToTokenBudget(
+                truncated[i].content,
+                compressTargetTokens,
+                'content'
+              ),
+            };
+            this.outputChannel.appendLine(`    Compressed message ${i}: ${originalLen} → ${(truncated[i] as any).content.length} chars`);
           }
         }
       }
@@ -1000,6 +1366,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         }
       }
 
+      this.lastKnownModels = models.map(model => ({
+        ...model,
+        capabilities: { ...model.capabilities },
+      }));
       this.outputChannel.appendLine(`Found ${models.length} models: ${models.map(m => m.id).join(', ')}`);
       return models;
     } catch (error) {
@@ -1013,6 +1383,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
             vscode.commands.executeCommand('workbench.action.openSettings', 'github.copilot.llm-gateway');
           }
         });
+      }
+
+      if (this.lastKnownModels.length > 0) {
+        this.outputChannel.appendLine(`WARNING: Returning ${this.lastKnownModels.length} cached models to avoid dropping the active selection during a transient failure.`);
+        return this.lastKnownModels.map(model => ({
+          ...model,
+          capabilities: { ...model.capabilities },
+        }));
       }
 
       return [];
@@ -1246,7 +1624,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (args === null) {
       this.outputChannel.appendLine(`  ERROR: Failed to parse tool call arguments`);
       this.outputChannel.appendLine(`  Full arguments: ${toolCall.arguments}`);
-      args = {};
+      this.outputChannel.appendLine(`  BLOCKED: Skipping malformed tool call`);
+      this.outputChannel.appendLine(`=== END TOOL CALL ===\n`);
+      progress.report(new vscode.LanguageModelTextPart(`Skipped malformed tool call '${toolCall.name}' because its arguments were truncated or invalid.`));
+      return;
     } else {
       const argKeys = Object.keys(args);
       this.outputChannel.appendLine(`  Parsed argument keys: ${argKeys.length > 0 ? argKeys.join(', ') : '(none)'}`);
@@ -1257,8 +1638,49 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       args = this.fillMissingRequiredProperties(args, toolCall.name, toolSchema);
     }
 
+    const sanitization = this.sanitizeToolPathArguments(toolCall.name, args);
+    if (sanitization.blockedPathArguments.length > 0) {
+      this.outputChannel.appendLine(`  BLOCKED: Path arguments outside workspace roots: ${sanitization.blockedPathArguments.join(', ')}`);
+      this.outputChannel.appendLine(`=== END TOOL CALL ===\n`);
+      progress.report(new vscode.LanguageModelTextPart(`Blocked tool call '${toolCall.name}' because it referenced files outside the active workspace.`));
+      return;
+    }
+
+    args = sanitization.args;
+
     this.outputChannel.appendLine(`=== END TOOL CALL ===\n`);
     progress.report(new vscode.LanguageModelToolCallPart(toolCall.id, toolCall.name, args));
+  }
+
+  private async closeAndDrainStreamIterator(
+    iterator: AsyncIterator<any>,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    allowToolExecution: boolean
+  ): Promise<number> {
+    if (typeof iterator.return !== 'function') {
+      return 0;
+    }
+
+    let drainedToolCalls = 0;
+
+    try {
+      let closeResult = await iterator.return(undefined);
+      while (!closeResult.done) {
+        const chunk = closeResult.value;
+        if (allowToolExecution && chunk?.finished_tool_calls?.length) {
+          for (const toolCall of chunk.finished_tool_calls) {
+            drainedToolCalls++;
+            this.processToolCall(toolCall, progress);
+          }
+        }
+        closeResult = await iterator.next();
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.outputChannel.appendLine(`DEBUG: Stream iterator cleanup ended with: ${errorMessage}`);
+    }
+
+    return drainedToolCalls;
   }
 
   /**
@@ -1294,10 +1716,32 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress.report(new vscode.LanguageModelTextPart(errorMessage));
   }
 
+  private isCancellationError(error: unknown, token?: vscode.CancellationToken): boolean {
+    if (token?.isCancellationRequested) {
+      return true;
+    }
+
+    if (error instanceof vscode.CancellationError) {
+      return true;
+    }
+
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return /request cancelled|request canceled|cancelled|canceled/i.test(errorMessage);
+  }
+
   /**
    * Handle chat request error
    */
-  private handleChatError(error: unknown): never {
+  private handleChatError(
+    error: unknown,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    token?: vscode.CancellationToken
+  ): void {
+    if (this.isCancellationError(error, token)) {
+      this.outputChannel.appendLine('Chat request cancelled');
+      return;
+    }
+
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : '';
 
@@ -1307,6 +1751,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     }
 
     const isToolError = errorMessage.includes('HarmonyError') || errorMessage.includes('unexpected tokens');
+    const chatErrorMessage = `I couldn't complete the request with the selected model.\n\nReason: ${errorMessage}\n\nThe selected model remains active. Check the \"GitHub Copilot LLM Gateway\" output panel for details.`;
+    progress.report(new vscode.LanguageModelTextPart(chatErrorMessage));
 
     if (isToolError) {
       this.outputChannel.appendLine('HINT: This appears to be a tool calling format error.');
@@ -1326,8 +1772,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     } else {
       vscode.window.showErrorMessage(`GitHub Copilot LLM Gateway: Chat request failed. ${errorMessage}`);
     }
-
-    throw error;
   }
 
   /**
@@ -1419,6 +1863,61 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     return adapted;
   }
 
+  private getModelContextLimit(modelId: string): number {
+    const { realId } = parseModelVariant(modelId);
+    return this.modelMetadata.get(modelId)?.maxTokens
+      || this.modelMetadata.get(realId)?.maxTokens
+      || this.config.defaultMaxTokens
+      || 32768;
+  }
+
+  private renderMessageForCondensation(msg: Record<string, unknown>): string | undefined {
+    const role = typeof msg.role === 'string' ? msg.role : 'unknown';
+
+    if (role === 'tool') {
+      const content = typeof msg.content === 'string' ? msg.content : '';
+      const excerpt = content.length > 500 ? `${content.substring(0, 500)}...[truncated]` : content;
+      return excerpt.trim() ? `[tool result]: ${excerpt}` : undefined;
+    }
+
+    let content = typeof msg.content === 'string' ? msg.content : (msg.content ? JSON.stringify(msg.content) : '');
+    if (content.length > 2000) {
+      content = `${content.substring(0, 2000)}...[truncated]`;
+    }
+    if (!content.trim()) {
+      return undefined;
+    }
+
+    const parts = [`[${role}]: ${content}`];
+    const toolCalls = Array.isArray((msg as any).tool_calls) ? (msg as any).tool_calls as any[] : [];
+    if (toolCalls.length > 0) {
+      const names = toolCalls.map((tc: any) => tc?.function?.name || 'unknown').join(', ');
+      parts.push(`[${role} called tools: ${names}]`);
+    }
+
+    return parts.join('\n');
+  }
+
+  private mergeSummaryIntoMessage(
+    message: Record<string, unknown>,
+    summaryBlock: string,
+    prepend: boolean = false
+  ): Record<string, unknown> {
+    const existingContent = typeof message.content === 'string'
+      ? message.content
+      : (message.content ? JSON.stringify(message.content) : '');
+    const mergedContent = existingContent.trim().length === 0
+      ? summaryBlock
+      : prepend
+        ? `${summaryBlock}\n\n${existingContent}`
+        : `${existingContent}\n\n---\n\n${summaryBlock}`;
+
+    return {
+      ...message,
+      content: mergedContent,
+    };
+  }
+
   /**
    * Condense older conversation messages using the LLM to produce a compact summary.
    * Keeps the system prompt (first message) and the last KEEP_RECENT messages intact.
@@ -1431,6 +1930,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     token: vscode.CancellationToken
   ): Promise<Record<string, unknown>[]> {
     const KEEP_RECENT = 6;
+    const modelContextLimit = this.getModelContextLimit(modelId);
+    const condensationInputBudgetTokens = Math.max(1024, Math.min(8192, Math.floor(modelContextLimit * 0.35)));
+    const condensationOutputBudgetTokens = Math.max(512, Math.min(2048, Math.floor(modelContextLimit * 0.12)));
+    const condensationInputBudgetChars = Math.max(512, Math.floor(condensationInputBudgetTokens * 3.3));
 
     if (messages.length <= KEEP_RECENT + 2) {
       return messages;
@@ -1446,40 +1949,40 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       return messages;
     }
 
-    // Build a text representation of older messages for the condensation prompt
-    const conversationParts: string[] = [];
-    for (const msg of oldMessages) {
-      const role = typeof msg.role === 'string' ? msg.role : 'unknown';
+    const renderableOldMessages = oldMessages
+      .map((msg, index) => {
+        const text = this.renderMessageForCondensation(msg);
+        return text ? { index, text } : undefined;
+      })
+      .filter((entry): entry is { index: number; text: string } => !!entry);
 
-      // Skip empty tool results in the condensation input to save tokens
-      if (role === 'tool') {
-        const content = typeof msg.content === 'string' ? msg.content : '';
-        // Include only a short excerpt for tool results
-        const excerpt = content.length > 500 ? content.substring(0, 500) + '...[truncated]' : content;
-        if (excerpt.trim()) {
-          conversationParts.push(`[tool result]: ${excerpt}`);
-        }
+    const selectedMessages: Array<{ index: number; text: string }> = [];
+    let usedChars = 0;
+    for (let i = renderableOldMessages.length - 1; i >= 0; i--) {
+      const candidate = renderableOldMessages[i];
+      const separatorChars = selectedMessages.length > 0 ? 2 : 0;
+      if (usedChars + separatorChars + candidate.text.length <= condensationInputBudgetChars) {
+        selectedMessages.unshift(candidate);
+        usedChars += separatorChars + candidate.text.length;
         continue;
       }
 
-      let content = typeof msg.content === 'string' ? msg.content : (msg.content ? JSON.stringify(msg.content) : '');
-      if (content.length > 2000) {
-        content = content.substring(0, 2000) + '...[truncated]';
+      if (selectedMessages.length === 0) {
+        const truncatedText = this.truncateTextToTokenBudget(
+          candidate.text,
+          Math.max(128, Math.floor(condensationInputBudgetTokens * 0.5)),
+          'condensation input'
+        );
+        selectedMessages.unshift({ index: candidate.index, text: truncatedText });
       }
-      if (content.trim()) {
-        conversationParts.push(`[${role}]: ${content}`);
-      }
-
-      // Note tool calls
-      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-        const names = msg.tool_calls.map((tc: any) => tc?.function?.name || 'unknown').join(', ');
-        conversationParts.push(`[${role} called tools: ${names}]`);
-      }
+      break;
     }
 
-    const conversationText = conversationParts.join('\n\n');
+    const totalRenderableCount = renderableOldMessages.length;
+    const summarizedCount = selectedMessages.length;
+    const omittedCount = Math.max(0, totalRenderableCount - summarizedCount);
+    const conversationText = selectedMessages.map((entry) => entry.text).join('\n\n');
     if (conversationText.trim().length < 100) {
-      // Too little content to bother condensing
       return messages;
     }
 
@@ -1490,19 +1993,32 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       `- Current work state (what is done, what is pending)\n` +
       `- Errors encountered and their resolutions\n` +
       `- Important constraints or user preferences\n\n` +
+      (omittedCount > 0
+        ? `Note: ${omittedCount} oldest older messages were omitted from this condensation input because the conversation already exceeded the summarization budget. Preserve continuity from the included newer history.\n\n`
+        : '') +
       `Respond with ONLY the summary. No meta-commentary.\n\n---\n\n${conversationText}`;
 
-    this.outputChannel.appendLine(`Condensation: summarizing ${oldMessages.length} older messages (${conversationText.length} chars)...`);
+    this.outputChannel.appendLine(
+      `Condensation: summarizing ${summarizedCount}/${totalRenderableCount} older messages (${conversationText.length} chars, budget ~${condensationInputBudgetTokens} tokens)...`
+    );
 
     try {
+      let condensationRequestMessages: Record<string, unknown>[] = [
+        { role: 'system', content: 'You are a conversation summarizer. Be concise but preserve all technically important details.' },
+        { role: 'user', content: condensationPrompt },
+      ];
+
+      if (this.detectedBackend === 'llamacpp') {
+        condensationRequestMessages = this.adaptMessagesForTemplate(condensationRequestMessages);
+      }
+
+      condensationRequestMessages = this.ensureConversationHasUserTurn(condensationRequestMessages, condensationRequestMessages);
+
       const summary = await this.client.chatComplete(
         {
           model: modelId,
-          messages: [
-            { role: 'system', content: 'You are a conversation summarizer. Be concise but preserve all technically important details.' },
-            { role: 'user', content: condensationPrompt },
-          ],
-          max_tokens: 2048,
+          messages: condensationRequestMessages,
+          max_tokens: condensationOutputBudgetTokens,
           temperature: 0.1,
         } as any,
         token
@@ -1514,14 +2030,24 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       }
 
       const condensed: Record<string, unknown>[] = [];
+      const summaryHeader = omittedCount > 0
+        ? `[Condensed conversation context — latest ${summarizedCount} of ${totalRenderableCount} older messages summarized]`
+        : `[Condensed conversation context — ${totalRenderableCount} older messages summarized]`;
+      const summaryBlock = `${summaryHeader}\n${summary.trim()}`;
+
       if (hasSystem) {
-        condensed.push(messages[0]);
+        condensed.push(this.mergeSummaryIntoMessage(messages[0], summaryBlock));
+        condensed.push(...recentMessages);
+      } else {
+        const recentWithSummary = [...recentMessages];
+        const firstUserIndex = recentWithSummary.findIndex((msg) => msg.role === 'user');
+        if (firstUserIndex >= 0) {
+          recentWithSummary[firstUserIndex] = this.mergeSummaryIntoMessage(recentWithSummary[firstUserIndex], summaryBlock, true);
+        } else {
+          recentWithSummary.unshift({ role: 'user', content: summaryBlock });
+        }
+        condensed.push(...recentWithSummary);
       }
-      condensed.push({
-        role: 'system',
-        content: `[Condensed conversation context — ${oldMessages.length} messages summarized]\n${summary.trim()}`,
-      });
-      condensed.push(...recentMessages);
 
       const oldTokens = this.estimatePromptTokens(messages);
       const newTokens = this.estimatePromptTokens(condensed);
@@ -1531,9 +2057,30 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
       return condensed;
     } catch (error) {
+      if (this.isCancellationError(error, token)) {
+        throw error;
+      }
       this.outputChannel.appendLine(`Condensation failed: ${error}. Falling back to truncation.`);
       return messages;
     }
+  }
+
+  private async condenseAndTrimIfNeeded(
+    messages: Record<string, unknown>[],
+    modelId: string,
+    tools: readonly any[] | undefined,
+    token: vscode.CancellationToken,
+    logPrefix: string
+  ): Promise<Record<string, unknown>[]> {
+    let condensed = await this.condenseMessages(messages, parseModelVariant(modelId).realId, token);
+    const postCondensePrediction = this.predictContextOverflow(condensed, tools || [], modelId);
+    if (postCondensePrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
+      this.outputChannel.appendLine(
+        `${logPrefix}: still at ${((postCondensePrediction.estimatedTotalTokens / postCondensePrediction.contextLimit) * 100).toFixed(1)}%. Applying fallback truncation.`
+      );
+      condensed = this.applySmartTruncation(condensed, postCondensePrediction, modelId);
+    }
+    return condensed;
   }
 
   /**
@@ -1546,272 +2093,270 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
-    this.outputChannel.appendLine(`Tool mode: ${options.toolMode}, Tools: ${options.tools?.length || 0}`);
-    this.outputChannel.appendLine(`Message count: ${messages.length}`);
+    try {
+      this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
+      this.outputChannel.appendLine(`Tool mode: ${options.toolMode}, Tools: ${options.tools?.length || 0}`);
+      this.outputChannel.appendLine(`Message count: ${messages.length}`);
 
-    // Resolve model variant: strip "__rb:<N>" suffix, extract per-variant budget
-    const { realId: actualModelId, variantBudget } = parseModelVariant(model.id);
-    if (variantBudget !== null) {
-      this.outputChannel.appendLine(`Model variant resolved: realId=${actualModelId}, variantBudget=${variantBudget}`);
-    }
+      // Resolve model variant: strip "__rb:<N>" suffix, extract per-variant budget
+      const { realId: actualModelId, variantBudget } = parseModelVariant(model.id);
+      if (variantBudget !== null) {
+        this.outputChannel.appendLine(`Model variant resolved: realId=${actualModelId}, variantBudget=${variantBudget}`);
+      }
 
-    this.showWelcomeNotification(model.id);
+      this.showWelcomeNotification(model.id);
 
-    // Convert messages
-    let openAIMessages: Record<string, unknown>[] = [];
-    for (const msg of messages) {
-      openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
-    }
-    openAIMessages = this.sanitizePromptMessages(openAIMessages);
+      // Convert messages
+      let openAIMessages: Record<string, unknown>[] = [];
+      for (const msg of messages) {
+        openAIMessages.push(...this.convertSingleMessageWithLogging(msg));
+      }
+      openAIMessages = this.sanitizePromptMessages(openAIMessages);
 
-    const combinedSystemPrompt = await this.buildCombinedSystemPrompt(openAIMessages);
-    if (combinedSystemPrompt) {
-      openAIMessages.unshift({ role: 'system', content: combinedSystemPrompt });
-      this.outputChannel.appendLine(`Prepended combined system prompt (${combinedSystemPrompt.length} chars)`);
-    }
+      const combinedSystemPrompt = await this.buildCombinedSystemPrompt(openAIMessages);
+      if (combinedSystemPrompt) {
+        openAIMessages.unshift({ role: 'system', content: combinedSystemPrompt });
+        this.outputChannel.appendLine(`Prepended combined system prompt (${combinedSystemPrompt.length} chars)`);
+      }
 
-    // Adapt messages to the detected llama.cpp chat template before sending,
-    // so 'tool' / 'system' roles are not silently mangled by an incompatible template.
-    if (this.detectedBackend === 'llamacpp') {
-      openAIMessages = this.adaptMessagesForTemplate(openAIMessages);
-    }
+      // Adapt messages to the detected llama.cpp chat template before sending,
+      // so 'tool' / 'system' roles are not silently mangled by an incompatible template.
+      if (this.detectedBackend === 'llamacpp') {
+        openAIMessages = this.adaptMessagesForTemplate(openAIMessages);
+      }
 
-    openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
-    this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
+      openAIMessages = this.ensureConversationHasUserTurn(openAIMessages, openAIMessages);
+      this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
 
-    // Log message structure
-    for (let i = 0; i < openAIMessages.length; i++) {
-      const msg = openAIMessages[i];
-      const toolCallId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'none';
-      this.outputChannel.appendLine(`  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
-    }
+      // Log message structure
+      for (let i = 0; i < openAIMessages.length; i++) {
+        const msg = openAIMessages[i];
+        const toolCallId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'none';
+        this.outputChannel.appendLine(`  Message ${i + 1}: role=${msg.role}, hasContent=${!!msg.content}, hasToolCalls=${!!msg.tool_calls}, toolCallId=${toolCallId}`);
+      }
 
-    // Predict context overflow BEFORE sending request
-    const overflowPrediction = this.predictContextOverflow(
-      openAIMessages,
-      options.tools || [],
-      model.id
-    );
-
-    if (overflowPrediction.warningLevel === 'critical') {
-      this.outputChannel.appendLine(`⚠️ CRITICAL: Context overflow predicted before sending request`);
-      this.outputChannel.appendLine(`  Estimated total: ${overflowPrediction.estimatedTotalTokens} tokens`);
-      this.outputChannel.appendLine(`  Limit: ${overflowPrediction.contextLimit} tokens`);
-      this.outputChannel.appendLine(`  Action: ${overflowPrediction.recommendedAction}`);
-
-      // Show user warning
-      vscode.window.showWarningMessage(
-        `LLM Gateway: Request may exceed context limit (${overflowPrediction.estimatedTotalTokens}/${overflowPrediction.contextLimit} tokens). Gateway will truncate automatically.`,
-        'View Details'
-      ).then((selection) => {
-        if (selection === 'View Details') {
-          this.outputChannel.show();
-        }
-      });
-    }
-
-    // Apply proactive truncation if enabled
-    let messagesToSend = openAIMessages;
-
-    // Calculate context usage percentage for condensation check
-    const usagePercent = (overflowPrediction.estimatedTotalTokens / overflowPrediction.contextLimit) * 100;
-    const condensationThreshold = this.config.contextCondensationThreshold || 80;
-
-    if (usagePercent >= condensationThreshold && openAIMessages.length > 8) {
-      // Try LLM-based condensation first — preserves context better than mechanical truncation
-      this.outputChannel.appendLine(
-        `Context at ${usagePercent.toFixed(1)}% (threshold: ${condensationThreshold}%). Attempting LLM condensation...`
+      // Predict context overflow BEFORE sending request
+      const overflowPrediction = this.predictContextOverflow(
+        openAIMessages,
+        options.tools || [],
+        model.id
       );
-      const { realId: condensationModelId } = parseModelVariant(model.id);
-      messagesToSend = await this.condenseMessages(openAIMessages, condensationModelId, token);
 
-      // Re-check after condensation; if still too large, apply mechanical truncation as fallback
-      const postCondensePrediction = this.predictContextOverflow(messagesToSend, options.tools || [], model.id);
-      if (postCondensePrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
-        this.outputChannel.appendLine(`Post-condensation still at ${((postCondensePrediction.estimatedTotalTokens / postCondensePrediction.contextLimit) * 100).toFixed(1)}%. Applying fallback truncation.`);
-        messagesToSend = this.applySmartTruncation(messagesToSend, postCondensePrediction, model.id);
-      }
-    } else if (overflowPrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
-      this.outputChannel.appendLine(`Applying proactive compaction: ${overflowPrediction.recommendedAction}`);
-      messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
-    }
+      if (overflowPrediction.warningLevel === 'critical') {
+        this.outputChannel.appendLine(`⚠️ CRITICAL: Context overflow predicted before sending request`);
+        this.outputChannel.appendLine(`  Estimated total: ${overflowPrediction.estimatedTotalTokens} tokens`);
+        this.outputChannel.appendLine(`  Limit: ${overflowPrediction.contextLimit} tokens`);
+        this.outputChannel.appendLine(`  Action: ${overflowPrediction.recommendedAction}`);
 
-    messagesToSend = this.ensureConversationHasUserTurn(messagesToSend, openAIMessages, overflowPrediction.contextLimit);
-
-    const truncatedMessages = messagesToSend;
-    if (truncatedMessages.length < openAIMessages.length) {
-      this.outputChannel.appendLine(`WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
-    }
-
-    // Build input text for token estimation
-    const inputText = this.buildInputText(truncatedMessages);
-
-    const toolsOverhead = this.estimateToolsTokens(options.tools as readonly any[] | undefined);
-    const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
-    const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(model.id, estimatedInputTokens, toolsOverhead);
-    const modelMaxContext = overflowPrediction.contextLimit;
-
-    this.outputChannel.appendLine(
-      `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
-    );
-
-    // Parse inline overrides from the last user message: /temp 0.2, /preset codegen, /grammar {...}
-    const inlineOverrides = this.parseInlineOverrides(truncatedMessages);
-    if (inlineOverrides.preset) {
-      const overridePreset = this.loadedPresets[inlineOverrides.preset];
-      if (overridePreset) {
-        this.outputChannel.appendLine(`Inline override: preset=${inlineOverrides.preset}`);
-      } else {
-        this.outputChannel.appendLine(`WARNING: Inline /preset '${inlineOverrides.preset}' not found, ignoring`);
-        inlineOverrides.preset = undefined;
-      }
-    }
-
-    // Build request with dynamic temperature from preset
-    const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
-    // Inline /preset override takes priority over config activePreset
-    const effectivePresetKey = inlineOverrides.preset ?? this.config.activePreset;
-    const activePreset = this.loadedPresets[effectivePresetKey] ?? this.getActivePreset();
-    const presetParams = activePreset
-      ? filterParamsForBackend(activePreset.params, this.detectedBackend)
-      : {};
-
-    // Determine temperature: tool mode uses agentTemperature, otherwise inline → preset → modelOptions → 0.7
-    let temperature = 0.7;
-    if (hasTools) {
-      temperature = this.config.agentTemperature ?? 0;
-    } else if (inlineOverrides.temperature !== undefined) {
-      temperature = inlineOverrides.temperature;
-    } else if (activePreset && activePreset.params.temperature !== undefined) {
-      temperature = activePreset.params.temperature;
-    } else if (options.modelOptions && typeof options.modelOptions.temperature === 'number') {
-      temperature = options.modelOptions.temperature;
-    }
-
-    const requestOptions: Record<string, unknown> = {
-      model: actualModelId,  // strip variant suffix before sending to server
-      messages: truncatedMessages,
-      max_tokens: safeMaxOutputTokens,
-      temperature,
-    };
-
-    // Apply preset sampling params (backend-filtered)
-    for (const [key, value] of Object.entries(presetParams)) {
-      if (key !== 'temperature' && value !== undefined) {
-        requestOptions[key] = value;
-      }
-    }
-    if (activePreset) {
-      this.outputChannel.appendLine(`Applied preset '${activePreset.name}' (backend: ${this.detectedBackend}): ${JSON.stringify(presetParams)}`);
-    }
-
-    // Resolve reasoning_budget: model variant > global config setting > preset (already applied above)
-    // Priority: variantBudget (from model picker) > config.reasoningBudget > preset's reasoning_budget
-    const effectiveBudget = variantBudget !== null ? variantBudget : this.config.reasoningBudget;
-    if (effectiveBudget !== null && effectiveBudget !== undefined) {
-      requestOptions['reasoning_budget'] = effectiveBudget;
-      this.outputChannel.appendLine(`Reasoning budget: ${effectiveBudget} (source: ${variantBudget !== null ? 'model variant' : 'global config'})`);
-    }
-
-    // llama.cpp reasoning/thinking support:
-    // - reasoning_format: "deepseek" tells the server to stream <think> content as separate
-    //   `reasoning_content` field in SSE delta chunks (instead of mixing into content).
-    // - chat_template_kwargs: {"enable_thinking": true} asks the Jinja template to activate
-    //   thinking mode (for models like Qwen3 that support togglable thinking via template kwarg).
-    // reasoningFormat setting: 'auto' = use template detection, 'deepseek' = force on, 'none' = force off
-    // In 'auto' mode: if a reasoning budget is explicitly set (variant or config), we also enable
-    // reasoning_format because the user clearly wants thinking — even if the template wasn't auto-detected.
-    if (this.detectedBackend === 'llamacpp') {
-      const formatSetting = this.config.reasoningFormat || 'auto';
-      const templateSupports = this.detectedTemplate.hasNativeThinking;
-      const hasBudget = effectiveBudget !== null && effectiveBudget !== undefined;
-      const budgetEnablesThinking = hasBudget && effectiveBudget !== 0;
-      const budgetDisablesThinking = hasBudget && effectiveBudget === 0;
-
-      // Determine whether reasoning_format should be enabled:
-      // 1. Setting = 'deepseek' → always enable
-      // 2. Setting = 'auto' + template supports → enable
-      // 3. Setting = 'auto' + reasoning budget explicitly set (>0 or -1) → enable (user clearly wants thinking)
-      const shouldEnable = formatSetting === 'deepseek'
-        || (formatSetting === 'auto' && templateSupports)
-        || (formatSetting === 'auto' && budgetEnablesThinking);
-
-      if (shouldEnable && !budgetDisablesThinking) {
-        requestOptions['reasoning_format'] = 'deepseek';
-        requestOptions['chat_template_kwargs'] = { enable_thinking: true };
-        const source = formatSetting === 'deepseek' ? 'forced by setting'
-          : templateSupports ? 'auto-detected from template'
-            : 'inferred from reasoning budget';
-        this.outputChannel.appendLine(`Reasoning format: deepseek (${source})`);
-      } else if (budgetDisablesThinking) {
-        // Budget = 0 means user explicitly disabled thinking
-        requestOptions['reasoning_format'] = 'none';
-        requestOptions['chat_template_kwargs'] = { enable_thinking: false };
-        this.outputChannel.appendLine('Reasoning format: none (thinking disabled by budget=0)');
-      } else if (formatSetting === 'none') {
-        requestOptions['reasoning_format'] = 'none';
-        this.outputChannel.appendLine('Reasoning format: none (forced by setting)');
-      }
-      // formatSetting='auto' && !templateSupports && no explicit budget: don't send anything
-    }
-
-    const toolsConfig = this.buildToolsConfig(options);
-    if (toolsConfig) {
-      requestOptions.tools = toolsConfig;
-      if (options.toolMode !== undefined) {
-        requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
-      }
-      requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
-      this.outputChannel.appendLine(`Sending ${toolsConfig.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
-    }
-
-    // Allow modelOptions to override preset params (backend-aware)
-    if (options.modelOptions) {
-      const allowedKeys = getAllowedKeysForBackend(this.detectedBackend);
-      for (const key of allowedKeys) {
-        if (key in options.modelOptions && (options.modelOptions as Record<string, unknown>)[key] !== undefined) {
-          (requestOptions as Record<string, unknown>)[key] = (options.modelOptions as Record<string, unknown>)[key];
-        }
-      }
-    }
-
-    // Apply inline /grammar or /schema override (llama.cpp only)
-    if (inlineOverrides.grammar && this.detectedBackend === 'llamacpp') {
-      requestOptions.grammar = inlineOverrides.grammar;
-      this.outputChannel.appendLine(`Inline override: grammar applied (${inlineOverrides.grammar.length} chars)`);
-    }
-    if (inlineOverrides.jsonSchema) {
-      requestOptions.response_format = { type: 'json_schema', json_schema: { name: 'response', schema: inlineOverrides.jsonSchema } };
-      this.outputChannel.appendLine(`Inline override: JSON schema applied`);
-    }
-
-    // Store conversation snapshot for export
-    this.lastConversation = {
-      modelId: model.id,
-      messages: truncatedMessages
-        .filter((m) => typeof m.role === 'string' && typeof m.content === 'string')
-        .map((m) => ({ role: m.role as string, content: m.content as string })),
-    };
-
-    // Log request (sanitized)
-    const sanitizedRequest = { ...requestOptions };
-    if (sanitizedRequest.messages && Array.isArray(sanitizedRequest.messages)) {
-      sanitizedRequest.messages = sanitizedRequest.messages.map((msg: any) => {
-        if (typeof msg === 'object' && msg !== null) {
-          const sanitized = { ...msg };
-          if (sanitized.content && typeof sanitized.content === 'string' && sanitized.content.length > 200) {
-            sanitized.content = sanitized.content.substring(0, 200) + '...[truncated]';
+        // Show user warning
+        vscode.window.showWarningMessage(
+          `LLM Gateway: Request may exceed context limit (${overflowPrediction.estimatedTotalTokens}/${overflowPrediction.contextLimit} tokens). Gateway will truncate automatically.`,
+          'View Details'
+        ).then((selection) => {
+          if (selection === 'View Details') {
+            this.outputChannel.show();
           }
-          return sanitized;
-        }
-        return msg;
-      });
-    }
-    const debugRequest = JSON.stringify(sanitizedRequest, null, 2);
-    this.outputChannel.appendLine(debugRequest.length > 2000 ? `Request (truncated): ${debugRequest.substring(0, 2000)}...` : `Request: ${debugRequest}`);
+        });
+      }
 
-    await this.executeStreamWithRetry(requestOptions, model, openAIMessages, options, token, progress, inputText);
+      // Apply proactive truncation if enabled
+      let messagesToSend = openAIMessages;
+
+      // Calculate context usage percentage for condensation check
+      const usagePercent = (overflowPrediction.estimatedTotalTokens / overflowPrediction.contextLimit) * 100;
+      const condensationThreshold = this.config.contextCondensationThreshold || 80;
+      const shouldAttemptCondensation = openAIMessages.length > 8
+        && (usagePercent >= condensationThreshold || overflowPrediction.willOverflow);
+
+      if (shouldAttemptCondensation) {
+        const condensationReason = usagePercent >= condensationThreshold
+          ? `Context at ${usagePercent.toFixed(1)}% (threshold: ${condensationThreshold}%). Attempting LLM condensation...`
+          : `Context overflow predicted at ${usagePercent.toFixed(1)}% before the configured condensation threshold ${condensationThreshold}%. Attempting LLM condensation anyway...`;
+        this.outputChannel.appendLine(condensationReason);
+        messagesToSend = await this.condenseAndTrimIfNeeded(openAIMessages, model.id, options.tools || [], token, 'Post-condensation');
+      } else if (overflowPrediction.warningLevel !== 'none' && this.config.enableProactiveTruncation !== false) {
+        this.outputChannel.appendLine(`Applying proactive compaction: ${overflowPrediction.recommendedAction}`);
+        messagesToSend = this.applySmartTruncation(openAIMessages, overflowPrediction, model.id);
+      }
+
+      messagesToSend = this.ensureConversationHasUserTurn(messagesToSend, openAIMessages, overflowPrediction.contextLimit);
+
+      const truncatedMessages = messagesToSend;
+      if (truncatedMessages.length < openAIMessages.length) {
+        this.outputChannel.appendLine(`WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`);
+      }
+
+      // Build input text for token estimation
+      const inputText = this.buildInputText(truncatedMessages);
+
+      const toolsOverhead = this.estimateToolsTokens(options.tools as readonly any[] | undefined);
+      const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
+      const safeMaxOutputTokens = this.calculateSafeMaxOutputTokens(model.id, estimatedInputTokens, toolsOverhead);
+      const modelMaxContext = overflowPrediction.contextLimit;
+
+      this.outputChannel.appendLine(
+        `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
+      );
+
+      // Parse inline overrides from the last user message: /temp 0.2, /preset codegen, /grammar {...}
+      const inlineOverrides = this.parseInlineOverrides(truncatedMessages);
+      if (inlineOverrides.preset) {
+        const overridePreset = this.loadedPresets[inlineOverrides.preset];
+        if (overridePreset) {
+          this.outputChannel.appendLine(`Inline override: preset=${inlineOverrides.preset}`);
+        } else {
+          this.outputChannel.appendLine(`WARNING: Inline /preset '${inlineOverrides.preset}' not found, ignoring`);
+          inlineOverrides.preset = undefined;
+        }
+      }
+
+      // Build request with dynamic temperature from preset
+      const hasTools = this.config.enableToolCalling && options.tools && options.tools.length > 0;
+      // Inline /preset override takes priority over config activePreset
+      const effectivePresetKey = inlineOverrides.preset ?? this.config.activePreset;
+      const activePreset = this.loadedPresets[effectivePresetKey] ?? this.getActivePreset();
+      const presetParams = activePreset
+        ? filterParamsForBackend(activePreset.params, this.detectedBackend)
+        : {};
+
+      // Determine temperature: tool mode uses agentTemperature, otherwise inline → preset → modelOptions → 0.7
+      let temperature = 0.7;
+      if (hasTools) {
+        temperature = this.config.agentTemperature ?? 0;
+      } else if (inlineOverrides.temperature !== undefined) {
+        temperature = inlineOverrides.temperature;
+      } else if (activePreset && activePreset.params.temperature !== undefined) {
+        temperature = activePreset.params.temperature;
+      } else if (options.modelOptions && typeof options.modelOptions.temperature === 'number') {
+        temperature = options.modelOptions.temperature;
+      }
+
+      const requestOptions: Record<string, unknown> = {
+        model: actualModelId,  // strip variant suffix before sending to server
+        messages: truncatedMessages,
+        max_tokens: safeMaxOutputTokens,
+        temperature,
+      };
+
+      // Apply preset sampling params (backend-filtered)
+      for (const [key, value] of Object.entries(presetParams)) {
+        if (key !== 'temperature' && value !== undefined) {
+          requestOptions[key] = value;
+        }
+      }
+      if (activePreset) {
+        this.outputChannel.appendLine(`Applied preset '${activePreset.name}' (backend: ${this.detectedBackend}): ${JSON.stringify(presetParams)}`);
+      }
+
+      // Resolve reasoning_budget: model variant > global config setting > preset (already applied above)
+      // Priority: variantBudget (from model picker) > config.reasoningBudget > preset's reasoning_budget
+      const effectiveBudget = variantBudget !== null ? variantBudget : this.config.reasoningBudget;
+      if (effectiveBudget !== null && effectiveBudget !== undefined) {
+        requestOptions['reasoning_budget'] = effectiveBudget;
+        this.outputChannel.appendLine(`Reasoning budget: ${effectiveBudget} (source: ${variantBudget !== null ? 'model variant' : 'global config'})`);
+      }
+
+      // llama.cpp reasoning/thinking support:
+      // - reasoning_format: "deepseek" tells the server to stream <think> content as separate
+      //   `reasoning_content` field in SSE delta chunks (instead of mixing into content).
+      // - chat_template_kwargs: {"enable_thinking": true} asks the Jinja template to activate
+      //   thinking mode (for models like Qwen3 that support togglable thinking via template kwarg).
+      // reasoningFormat setting: 'auto' = use template detection, 'deepseek' = force on, 'none' = force off
+      // In 'auto' mode: if a reasoning budget is explicitly set (variant or config), we also enable
+      // reasoning_format because the user clearly wants thinking — even if the template wasn't auto-detected.
+      if (this.detectedBackend === 'llamacpp') {
+        const formatSetting = this.config.reasoningFormat || 'auto';
+        const templateSupports = this.detectedTemplate.hasNativeThinking;
+        const hasBudget = effectiveBudget !== null && effectiveBudget !== undefined;
+        const budgetEnablesThinking = hasBudget && effectiveBudget !== 0;
+        const budgetDisablesThinking = hasBudget && effectiveBudget === 0;
+
+        // Determine whether reasoning_format should be enabled:
+        // 1. Setting = 'deepseek' → always enable
+        // 2. Setting = 'auto' + template supports → enable
+        // 3. Setting = 'auto' + reasoning budget explicitly set (>0 or -1) → enable (user clearly wants thinking)
+        const shouldEnable = formatSetting === 'deepseek'
+          || (formatSetting === 'auto' && templateSupports)
+          || (formatSetting === 'auto' && budgetEnablesThinking);
+
+        if (shouldEnable && !budgetDisablesThinking) {
+          requestOptions['reasoning_format'] = 'deepseek';
+          requestOptions['chat_template_kwargs'] = { enable_thinking: true };
+          const source = formatSetting === 'deepseek' ? 'forced by setting'
+            : templateSupports ? 'auto-detected from template'
+              : 'inferred from reasoning budget';
+          this.outputChannel.appendLine(`Reasoning format: deepseek (${source})`);
+        } else if (budgetDisablesThinking) {
+          // Budget = 0 means user explicitly disabled thinking
+          requestOptions['reasoning_format'] = 'none';
+          requestOptions['chat_template_kwargs'] = { enable_thinking: false };
+          this.outputChannel.appendLine('Reasoning format: none (thinking disabled by budget=0)');
+        } else if (formatSetting === 'none') {
+          requestOptions['reasoning_format'] = 'none';
+          this.outputChannel.appendLine('Reasoning format: none (forced by setting)');
+        }
+        // formatSetting='auto' && !templateSupports && no explicit budget: don't send anything
+      }
+
+      const toolsConfig = this.buildToolsConfig(options);
+      if (toolsConfig) {
+        requestOptions.tools = toolsConfig;
+        if (options.toolMode !== undefined) {
+          requestOptions.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto';
+        }
+        requestOptions.parallel_tool_calls = this.config.parallelToolCalling;
+        this.outputChannel.appendLine(`Sending ${toolsConfig.length} tools to model (parallel: ${this.config.parallelToolCalling})`);
+      }
+
+      // Allow modelOptions to override preset params (backend-aware)
+      if (options.modelOptions) {
+        const allowedKeys = getAllowedKeysForBackend(this.detectedBackend);
+        for (const key of allowedKeys) {
+          if (key in options.modelOptions && (options.modelOptions as Record<string, unknown>)[key] !== undefined) {
+            (requestOptions as Record<string, unknown>)[key] = (options.modelOptions as Record<string, unknown>)[key];
+          }
+        }
+      }
+
+      // Apply inline /grammar or /schema override (llama.cpp only)
+      if (inlineOverrides.grammar && this.detectedBackend === 'llamacpp') {
+        requestOptions.grammar = inlineOverrides.grammar;
+        this.outputChannel.appendLine(`Inline override: grammar applied (${inlineOverrides.grammar.length} chars)`);
+      }
+      if (inlineOverrides.jsonSchema) {
+        requestOptions.response_format = { type: 'json_schema', json_schema: { name: 'response', schema: inlineOverrides.jsonSchema } };
+        this.outputChannel.appendLine(`Inline override: JSON schema applied`);
+      }
+
+      // Store conversation snapshot for export
+      this.lastConversation = {
+        modelId: model.id,
+        messages: truncatedMessages
+          .filter((m) => typeof m.role === 'string' && typeof m.content === 'string')
+          .map((m) => ({ role: m.role as string, content: m.content as string })),
+      };
+
+      // Log request (sanitized)
+      const sanitizedRequest = { ...requestOptions };
+      if (sanitizedRequest.messages && Array.isArray(sanitizedRequest.messages)) {
+        sanitizedRequest.messages = sanitizedRequest.messages.map((msg: any) => {
+          if (typeof msg === 'object' && msg !== null) {
+            const sanitized = { ...msg };
+            if (sanitized.content && typeof sanitized.content === 'string' && sanitized.content.length > 200) {
+              sanitized.content = sanitized.content.substring(0, 200) + '...[truncated]';
+            }
+            return sanitized;
+          }
+          return msg;
+        });
+      }
+      const debugRequest = JSON.stringify(sanitizedRequest, null, 2);
+      this.outputChannel.appendLine(debugRequest.length > 2000 ? `Request (truncated): ${debugRequest.substring(0, 2000)}...` : `Request: ${debugRequest}`);
+
+      await this.executeStreamWithRetry(requestOptions, model, openAIMessages, options, token, progress, inputText);
+    } catch (error) {
+      this.handleChatError(error, progress, token);
+    }
   }
 
   private async executeStreamWithRetry(
@@ -1829,12 +2374,15 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     try {
       let totalContent = '';
       let totalToolCalls = 0;
+      let recoveredTaggedToolCalls = 0;
       let reasoningContent = '';
       let reasoningHandled = false;
       const streamStartMs = Date.now();
       let totalOutputChars = 0;     // all generated chars (content + reasoning)
       let totalReasoningChars = 0;  // reasoning-only chars
       const idleTimeout = this.config.streamingIdleTimeout;
+      const firstChunkTimeout = this.config.requestTimeout;
+      let hasReceivedFirstChunk = false;
       const iterator = this.client.streamChatCompletion(
         requestOptions as unknown as OpenAIChatCompletionRequest,
         token,
@@ -1842,70 +2390,155 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         this.config.retryDelay
       )[Symbol.asyncIterator]();
 
-      while (true) {
-        if (token.isCancellationRequested) { break; }
+      try {
+        while (true) {
+          if (token.isCancellationRequested) { break; }
 
-        let result: IteratorResult<any>;
-        if (idleTimeout > 0) {
-          let timeoutId: ReturnType<typeof setTimeout> | undefined;
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error('Streaming idle timeout')), idleTimeout);
-          });
-          try {
-            result = await Promise.race([iterator.next(), timeoutPromise]);
-          } catch (e: any) {
-            if (e.message === 'Streaming idle timeout') {
-              this.outputChannel.appendLine(`WARNING: Streaming idle timeout after ${idleTimeout}ms`);
-              break;
+          let result: IteratorResult<any>;
+          const effectiveTimeout = hasReceivedFirstChunk ? idleTimeout : firstChunkTimeout;
+          if (effectiveTimeout > 0) {
+            let timeoutId: ReturnType<typeof setTimeout> | undefined;
+            const timeoutErrorName = hasReceivedFirstChunk ? 'Streaming idle timeout' : 'Streaming first chunk timeout';
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              timeoutId = setTimeout(() => reject(new Error(timeoutErrorName)), effectiveTimeout);
+            });
+            try {
+              result = await Promise.race([iterator.next(), timeoutPromise]);
+            } catch (e: any) {
+              if (e.message === 'Streaming idle timeout') {
+                this.outputChannel.appendLine(`WARNING: Streaming idle timeout after ${effectiveTimeout}ms`);
+                break;
+              }
+              if (e.message === 'Streaming first chunk timeout') {
+                this.outputChannel.appendLine(`WARNING: Streaming first chunk timeout after ${effectiveTimeout}ms`);
+                break;
+              }
+              throw e;
+            } finally {
+              if (timeoutId !== undefined) { clearTimeout(timeoutId); }
             }
-            throw e;
-          } finally {
-            if (timeoutId !== undefined) { clearTimeout(timeoutId); }
+          } else {
+            result = await iterator.next();
           }
-        } else {
-          result = await iterator.next();
-        }
 
-        if (result.done) { break; }
-        const chunk = result.value;
+          if (result.done) { break; }
+          hasReceivedFirstChunk = true;
+          const chunk = result.value;
 
-        if (chunk.reasoning_content) {
-          reasoningContent += chunk.reasoning_content;
-          totalReasoningChars += chunk.reasoning_content.length;
-          totalOutputChars += chunk.reasoning_content.length;
-        }
+          if (chunk.reasoning_content) {
+            reasoningContent += chunk.reasoning_content;
+            totalReasoningChars += chunk.reasoning_content.length;
+            totalOutputChars += chunk.reasoning_content.length;
+          }
 
-        if (!reasoningHandled && reasoningContent && (chunk.content || chunk.finished_tool_calls?.length)) {
-          const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
-          reasoningHandled = true;
-          if (normalizedReasoning) {
-            if (this.config.showThinking) {
-              // Show thinking as blockquote (VS Code chat doesn't render HTML)
-              const thinkingLines = normalizedReasoning.split('\n').map(line => `> ${line}`).join('\n');
-              const thinkingSection = `> **💭 Thinking** *(${normalizedReasoning.length} chars)*\n${thinkingLines}\n\n---\n\n`;
-              progress.report(new vscode.LanguageModelTextPart(thinkingSection));
-              this.outputChannel.appendLine(`Displayed thinking content in chat UI (${normalizedReasoning.length} chars)`);
-            } else {
-              this.outputChannel.appendLine(`Suppressed reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+          const reasoningContainsTaggedToolCall = reasoningContent.includes('<tool_call>');
+          if (!reasoningHandled && reasoningContent && !reasoningContainsTaggedToolCall && (chunk.content || chunk.finished_tool_calls?.length)) {
+            const normalizedReasoning = this.normalizeReasoningContent(reasoningContent);
+            reasoningHandled = true;
+            if (normalizedReasoning) {
+              if (this.config.showThinking) {
+                // Show thinking as blockquote (VS Code chat doesn't render HTML)
+                const thinkingLines = normalizedReasoning.split('\n').map(line => `> ${line}`).join('\n');
+                const thinkingSection = `> **💭 Thinking** *(${normalizedReasoning.length} chars)*\n${thinkingLines}\n\n---\n\n`;
+                progress.report(new vscode.LanguageModelTextPart(thinkingSection));
+                this.outputChannel.appendLine(`Displayed thinking content in chat UI (${normalizedReasoning.length} chars)`);
+              } else {
+                this.outputChannel.appendLine(`Suppressed reasoning content from chat UI (${normalizedReasoning.length} chars)`);
+              }
+            }
+          }
+
+          if (chunk.content) {
+            const visibleContent = this.sanitizeVisibleContent(chunk.content);
+            if (visibleContent) {
+              totalContent += visibleContent;
+              totalOutputChars += visibleContent.length;
+              progress.report(new vscode.LanguageModelTextPart(visibleContent));
+            }
+          }
+
+          if (chunk.finished_tool_calls?.length) {
+            for (const toolCall of chunk.finished_tool_calls) {
+              totalToolCalls++;
+              this.processToolCall(toolCall, progress);
             }
           }
         }
+      } finally {
+        totalToolCalls += await this.closeAndDrainStreamIterator(iterator, progress, !token.isCancellationRequested);
+      }
 
-        if (chunk.content) {
-          const visibleContent = this.sanitizeVisibleContent(chunk.content);
-          if (visibleContent) {
-            totalContent += visibleContent;
-            totalOutputChars += visibleContent.length;
-            progress.report(new vscode.LanguageModelTextPart(visibleContent));
-          }
-        }
-
-        if (chunk.finished_tool_calls?.length) {
-          for (const toolCall of chunk.finished_tool_calls) {
+      if (totalToolCalls === 0) {
+        const extractedReasoningCalls = this.getRecoverableTaggedToolCalls(reasoningContent, 'reasoning_content');
+        if (extractedReasoningCalls) {
+          reasoningContent = extractedReasoningCalls.remainingText;
+          this.outputChannel.appendLine(`Recovered ${extractedReasoningCalls.toolCalls.length} tagged tool call(s) from reasoning_content fallback`);
+          for (const toolCall of extractedReasoningCalls.toolCalls) {
             totalToolCalls++;
+            recoveredTaggedToolCalls++;
             this.processToolCall(toolCall, progress);
           }
         }
+
+        if (totalToolCalls === 0) {
+          const extractedContentCalls = this.getRecoverableTaggedToolCalls(totalContent, 'content');
+          if (extractedContentCalls) {
+            totalContent = extractedContentCalls.remainingText;
+            this.outputChannel.appendLine(`Recovered ${extractedContentCalls.toolCalls.length} tagged tool call(s) from content fallback`);
+            for (const toolCall of extractedContentCalls.toolCalls) {
+              totalToolCalls++;
+              recoveredTaggedToolCalls++;
+              this.processToolCall(toolCall, progress);
+            }
+          }
+        }
+      }
+
+      const isReasoningOnlyEmptyResponse =
+        totalContent.length === 0
+        && totalToolCalls === 0
+        && reasoningContent.trim().length > 0;
+
+      const hasToolsInRequest = Array.isArray(requestOptions.tools) && requestOptions.tools.length > 0;
+      const reasoningFormat = typeof requestOptions.reasoning_format === 'string'
+        ? requestOptions.reasoning_format
+        : undefined;
+
+      if (
+        isReasoningOnlyEmptyResponse
+        && retryAttempt < 1
+        && this.detectedBackend === 'llamacpp'
+        && hasToolsInRequest
+        && reasoningFormat === 'deepseek'
+      ) {
+        this.outputChannel.appendLine(
+          'Reasoning-only response with no content/tool calls detected on llama.cpp. Retrying once without a separate reasoning stream so thinking stays enabled but the model must produce visible content or tool calls.'
+        );
+
+        const retryOptions: Record<string, unknown> = {
+          ...requestOptions,
+          chat_template_kwargs: {
+            ...(
+              typeof requestOptions.chat_template_kwargs === 'object' && requestOptions.chat_template_kwargs !== null
+                ? requestOptions.chat_template_kwargs as Record<string, unknown>
+                : {}
+            ),
+            enable_thinking: true,
+          },
+        };
+
+        delete retryOptions.reasoning_format;
+
+        return this.executeStreamWithRetry(
+          retryOptions,
+          model,
+          openAIMessages,
+          options,
+          token,
+          progress,
+          inputText,
+          retryAttempt + 1
+        );
       }
 
       if (!reasoningHandled && reasoningContent) {
@@ -1953,6 +2586,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       if (this.lastConversation && totalContent) {
         this.lastConversation.messages.push({ role: 'assistant', content: totalContent, thinking: reasoningContent || undefined });
       }
+      if (recoveredTaggedToolCalls > 0) {
+        this.outputChannel.appendLine(`Tool-call fallback activated: recovered ${recoveredTaggedToolCalls} tagged call(s) from unstructured output`);
+      }
       this.outputChannel.appendLine(`Completed chat request, received ${totalContent.length} chars content + ${totalReasoningChars} chars reasoning, ${totalToolCalls} tool calls, ~${outputTokenCount} output tokens (${reasoningTokens} thinking) in ${elapsedSec.toFixed(1)}s (~${tokPerSec} tok/s)`);
 
       if (totalContent.length === 0 && totalToolCalls === 0) {
@@ -1997,14 +2633,22 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
           : (this.modelMetadata.get(model.id)?.maxTokens || this.config.defaultMaxTokens);
         this.outputChannel.appendLine(`Context overflow from server: ${serverPromptTokens ?? 'unknown'} prompt tokens > ${serverContextSize} context. Retry ${retryAttempt + 1}/${maxContextRetries}`);
 
+        const { realId: actualModelId } = parseModelVariant(model.id);
+
         if (serverContextSize && serverContextSize > 0) {
-          this.modelMetadata.set(model.id, {
+          const updatedLimits = {
             maxTokens: serverContextSize,
             maxOutputTokens: Math.min(this.config.defaultMaxOutputTokens, Math.floor(serverContextSize / 2)),
-          });
+          };
+          this.modelMetadata.set(model.id, updatedLimits);
+          this.modelMetadata.set(actualModelId, updatedLimits);
         }
 
-        const currentMessages = Array.isArray(requestOptions.messages) ? requestOptions.messages as any[] : [];
+        let currentMessages = Array.isArray(requestOptions.messages) ? requestOptions.messages as any[] : [];
+        if (currentMessages.length > 8) {
+          this.outputChannel.appendLine('Attempting LLM condensation during context-overflow recovery before hard truncation.');
+          currentMessages = await this.condenseAndTrimIfNeeded(currentMessages, model.id, options.tools || [], token, 'Retry post-condensation');
+        }
         const reserveTokens = Math.max(256, Math.ceil(serverContextSize * 0.05));
         let retryTools = Array.isArray(requestOptions.tools) ? requestOptions.tools as Record<string, unknown>[] : undefined;
         let toolTokens = this.estimateToolsTokens(retryTools);
@@ -2070,7 +2714,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         return this.executeStreamWithRetry(retryOptions, model, openAIMessages, options, token, progress, newInputText, retryAttempt + 1);
       }
 
-      this.handleChatError(error);
+      throw error;
     }
   }
 
@@ -2120,17 +2764,30 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   private loadConfig(): GatewayConfig {
     const config = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
 
+    const requestTimeout = config.get<number>('requestTimeout', 300000);
+    const streamingIdleTimeoutInspect = config.inspect<number>('streamingIdleTimeout');
+    const hasExplicitStreamingIdleTimeout =
+      streamingIdleTimeoutInspect?.globalValue !== undefined ||
+      streamingIdleTimeoutInspect?.workspaceValue !== undefined ||
+      streamingIdleTimeoutInspect?.workspaceFolderValue !== undefined;
+    let streamingIdleTimeout = config.get<number>('streamingIdleTimeout', 120000);
+
+    // Keep streaming idle timeout aligned with request timeout unless the user explicitly overrides it.
+    if (!hasExplicitStreamingIdleTimeout) {
+      streamingIdleTimeout = requestTimeout;
+    }
+
     const cfg: GatewayConfig = {
       serverUrl: config.get<string>('serverUrl', 'http://localhost:8000'),
       apiKey: config.get<string>('apiKey', ''),
-      requestTimeout: config.get<number>('requestTimeout', 300000),
+      requestTimeout,
       defaultMaxTokens: config.get<number>('defaultMaxTokens', 32768),
       defaultMaxOutputTokens: config.get<number>('defaultMaxOutputTokens', 4096),
       enableToolCalling: config.get<boolean>('enableToolCalling', true),
       parallelToolCalling: config.get<boolean>('parallelToolCalling', true),
       agentTemperature: config.get<number>('agentTemperature', 0),
       toolExcludePatterns: config.get<string[]>('toolExcludePatterns', ['^search_view_results$', '^view_results$', '^vscode_internal', '^extension_', '^unknown_']),
-      streamingIdleTimeout: config.get<number>('streamingIdleTimeout', 120000),
+      streamingIdleTimeout,
       maxRetries: config.get<number>('maxRetries', 2),
       retryDelay: config.get<number>('retryDelay', 1000),
       systemPrompt: config.get<string>('systemPrompt', ''),
@@ -2150,6 +2807,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (cfg.requestTimeout <= 0) {
       this.outputChannel.appendLine(`ERROR: requestTimeout must be > 0; using default 60000`);
       cfg.requestTimeout = 60000;
+    }
+
+    // If unset, keep stream idle timeout in sync with the validated request timeout.
+    if (!hasExplicitStreamingIdleTimeout) {
+      cfg.streamingIdleTimeout = cfg.requestTimeout;
+      this.outputChannel.appendLine(
+        `INFO: github.copilot.llm-gateway.streamingIdleTimeout is not explicitly set; using requestTimeout (${cfg.requestTimeout}ms).`
+      );
+    }
+
+    if (cfg.streamingIdleTimeout < 0) {
+      this.outputChannel.appendLine(`ERROR: streamingIdleTimeout must be >= 0; using requestTimeout (${cfg.requestTimeout}ms)`);
+      cfg.streamingIdleTimeout = cfg.requestTimeout;
     }
 
     try {
